@@ -96,6 +96,10 @@ class Agent(Node):
     and output-field constraints, then runs iterative think/act cycles with optional tools.
     """
 
+    class Hook(Node.Hook):
+        THINK_COMPLETED = 'agent_think_completed'
+        ACT_COMPLETED = 'agent_act_completed'
+
     def __init__(self,
         name: str,
         instructions: str | list[str],
@@ -595,6 +599,10 @@ class Agent(Node):
                     settings["tool_choice"] = "auto"
 
                 response: dict = self.think(messages, settings=settings)
+
+                # Hook: agent_think_completed
+                self.hooks.dispatch(self.Hook.THINK_COMPLETED, self, response, messages)
+
                 if response["type"] == ModelResponseType.CONTENT:
                     response_content = self._strip_thinking_blocks(response["content"])
                     response_content_dict = self._out_formatter.format(response_content)
@@ -614,6 +622,9 @@ class Agent(Node):
 
                 tool_calls = response["content"]
                 tool_results = self.act(tool_calls)
+
+                # Hook: agent_act_completed
+                self.hooks.dispatch(self.Hook.ACT_COMPLETED, self, tool_calls, tool_results)
 
                 # Preserve existing behavior: append the raw assistant tool-call message
                 # when available (OpenAI), then append tool results.
