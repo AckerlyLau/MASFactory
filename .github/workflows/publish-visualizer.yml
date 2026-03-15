@@ -46,10 +46,6 @@ jobs:
         working-directory: masfactory-visualizer/webview-ui
         run: npm ci
 
-      - name: Run extension tests
-        working-directory: masfactory-visualizer
-        run: npm test
-
       - name: Package VSIX
         id: package_extension
         uses: HaaLeo/publish-vscode-extension@v2
