@@ -129,15 +129,7 @@ config.local.toml
 tmp/
 temp/
 bug_pic/
-test/**
 test/
-!test/
-!test/masfactory-visualizer/
-!test/masfactory-visualizer/**
-!test/test_*.py
-!test/**/test_*.py
-test/masfactory-visualizer/**/__pycache__/
-test/masfactory-visualizer/**/*.py[cod]
 masfactory-visualizer/test/**
 masfactory-visualizer/test/
 **/tests/

@@ -199,7 +199,8 @@ export function parseBuilderFunction(
             nodePullKeys: {},
             nodePushKeys: {},
             nodeAttributes: {},
-            subgraphParents: {}
+            subgraphParents: {},
+            literalValues: {}
         };
         
         const edges: GraphEdge[] = [];
@@ -207,7 +208,8 @@ export function parseBuilderFunction(
             edges,
             variableToNodeName: nodeCtx.variableToNodeName,
             nodes,
-            subgraphParents: {}
+            subgraphParents: {},
+            literalValues: nodeCtx.literalValues
         };
         
         const subgraphs: { [parent: string]: string[] } = {};

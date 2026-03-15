@@ -16,6 +16,13 @@ type PreviewDocState = {
   edgeStyle: 'fan' | 'straight';
   collapsedSubgraphs: Record<string, boolean>;
   overlayCollapsed: Record<string, boolean>;
+  controlPanel: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    collapsed: boolean;
+  };
   positions: Record<string, { x: number; y: number }>;
   zoom: number | null;
   pan: { x: number; y: number } | null;
@@ -44,6 +51,13 @@ function defaultDocState(): PreviewDocState {
     edgeStyle: 'fan',
     collapsedSubgraphs: {},
     overlayCollapsed: {},
+    controlPanel: {
+      x: 10,
+      y: 10,
+      width: 320,
+      height: 560,
+      collapsed: false
+    },
     positions: {},
     zoom: null,
     pan: null,
@@ -157,6 +171,15 @@ export const usePreviewStore = defineStore('preview', {
       if (!st.edgeStyle) st.edgeStyle = 'fan';
       if (!st.collapsedSubgraphs) st.collapsedSubgraphs = {};
       if (!st.overlayCollapsed) st.overlayCollapsed = {};
+      if (!st.controlPanel) {
+        st.controlPanel = {
+          x: 10,
+          y: 10,
+          width: 320,
+          height: 560,
+          collapsed: false
+        };
+      }
       if (!st.positions) st.positions = {};
       if (st.zoom === undefined) st.zoom = null;
       if (st.pan === undefined) st.pan = null;
@@ -234,6 +257,34 @@ export const usePreviewStore = defineStore('preview', {
       else delete doc.overlayCollapsed[graphId];
       persistDebounced(this.persisted);
     },
+    setControlPanelState(
+      patch: Partial<{
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+        collapsed: boolean;
+      }>
+    ): void {
+      const uri = this.documentUri;
+      if (!uri) return;
+      const doc = this.ensureDocState(uri);
+      const current = doc.controlPanel || {
+        x: 10,
+        y: 10,
+        width: 320,
+        height: 560,
+        collapsed: false
+      };
+      doc.controlPanel = {
+        x: typeof patch.x === 'number' ? patch.x : current.x,
+        y: typeof patch.y === 'number' ? patch.y : current.y,
+        width: typeof patch.width === 'number' ? patch.width : current.width,
+        height: typeof patch.height === 'number' ? patch.height : current.height,
+        collapsed: typeof patch.collapsed === 'boolean' ? patch.collapsed : current.collapsed
+      };
+      persistDebounced(this.persisted);
+    },
     setViewport(zoom: number, pan: { x: number; y: number }): void {
       const uri = this.documentUri;
       if (!uri) return;
@@ -309,15 +360,17 @@ export const usePreviewStore = defineStore('preview', {
       if (!docState.edgeStyle) docState.edgeStyle = 'fan';
 
       // Standalone NodeTemplate selection (if present).
-      const candidatesRaw = (payload.data as any)?.templateCandidates;
+      const candidatesRaw = (payload.data as any)?.graphCandidates ?? (payload.data as any)?.templateCandidates;
       const candidates = Array.isArray(candidatesRaw)
         ? candidatesRaw.filter((x: any) => typeof x === 'string' && x.trim()).map((x: any) => String(x).trim())
         : [];
-      const selectedRaw = (payload.data as any)?.selectedTemplate;
+      const selectedRaw = (payload.data as any)?.selectedGraph ?? (payload.data as any)?.selectedTemplate;
       const selected =
         typeof selectedRaw === 'string' && selectedRaw.trim()
           ? selectedRaw.trim()
-          : candidates.length > 0
+          : candidates.length > 1
+            ? 'all'
+            : candidates.length > 0
             ? candidates[candidates.length - 1]
             : null;
 

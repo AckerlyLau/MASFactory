@@ -34,7 +34,7 @@ export type PreviewClearMessage = { type: 'clear'; protocolVersion?: number; rea
 
 export type UiSetActiveTabMessage = {
   type: 'uiSetActiveTab';
-  tab: 'preview' | 'debug' | 'run' | 'vibe';
+  tab: 'preview' | 'debug' | 'run' | 'drag' | 'vibe';
 };
 
 export type AppInboundMessage<TGraphData = unknown> =
@@ -273,7 +273,7 @@ export function parseAppInboundMessage<TGraphData = unknown>(data: unknown): App
 
   if (type === 'uiSetActiveTab') {
     const tab = asString((data as any).tab);
-    if (tab !== 'preview' && tab !== 'debug' && tab !== 'run' && tab !== 'vibe') return null;
+    if (tab !== 'preview' && tab !== 'debug' && tab !== 'run' && tab !== 'drag' && tab !== 'vibe') return null;
     return { type, tab };
   }
 

@@ -44,24 +44,77 @@ function resolveTemplateBaseKind(
     return byLast ? byLast.baseKind : null;
 }
 
-function isLoopType(nodeType: string, templates?: { [name: string]: ParsedNodeTemplate }): boolean {
+function normalizeTypeName(raw: string): string {
+    return raw.includes('.') ? raw.split('.').pop()! : raw;
+}
+
+function resolveLocalClassKind(
+    nodeType: string,
+    localClassBases?: { [name: string]: string[] },
+    templates?: { [name: string]: ParsedNodeTemplate },
+    visited: Set<string> = new Set()
+): 'Graph' | 'Loop' | null {
+    if (!localClassBases) return null;
+    const normalized = normalizeTypeName(nodeType);
+    if (!normalized || visited.has(normalized)) return null;
+    visited.add(normalized);
+
+    const bases = localClassBases[normalized] || localClassBases[nodeType];
+    if (!bases || bases.length === 0) return null;
+
+    for (const base of bases) {
+        const baseName = normalizeTypeName(base);
+        const templateKind = resolveTemplateBaseKind(baseName, templates);
+        if (templateKind === 'Graph' || templateKind === 'Loop') return templateKind;
+        if (baseName === 'Loop' || LOOP_TYPES.includes(baseName) || baseName.endsWith('Loop')) return 'Loop';
+        if (
+            baseName === 'Graph' ||
+            baseName === 'RootGraph' ||
+            GRAPH_TYPES.includes(baseName) ||
+            baseName.endsWith('Graph') ||
+            baseName.endsWith('Workflow')
+        ) {
+            return 'Graph';
+        }
+        const inherited = resolveLocalClassKind(baseName, localClassBases, templates, visited);
+        if (inherited) return inherited;
+    }
+
+    return null;
+}
+
+function isLoopType(
+    nodeType: string,
+    templates?: { [name: string]: ParsedNodeTemplate },
+    localClassBases?: { [name: string]: string[] }
+): boolean {
     const normalized = nodeType.includes('.') ? nodeType.split('.').pop()! : nodeType;
     const templateKind = resolveTemplateBaseKind(nodeType, templates);
     if (templateKind === 'Loop') return true;
+    const localKind = resolveLocalClassKind(nodeType, localClassBases, templates);
+    if (localKind === 'Loop') return true;
+    if (localKind === 'Graph') return false;
     return LOOP_TYPES.includes(normalized) || normalized.endsWith('Loop');
 }
 
 /**
  * Check if a node type is a Graph-based type (subgraph with entry/exit)
  */
-function isGraphType(nodeType: string, templates?: { [name: string]: ParsedNodeTemplate }): boolean {
+function isGraphType(
+    nodeType: string,
+    templates?: { [name: string]: ParsedNodeTemplate },
+    localClassBases?: { [name: string]: string[] }
+): boolean {
     const normalized = nodeType.includes('.') ? nodeType.split('.').pop()! : nodeType;
     const templateKind = resolveTemplateBaseKind(nodeType, templates);
     if (templateKind === 'Graph') return true;
+    const localKind = resolveLocalClassKind(nodeType, localClassBases, templates);
+    if (localKind === 'Graph') return true;
+    if (localKind === 'Loop') return false;
     if (GRAPH_TYPES.includes(normalized)) return true;
     // Best-effort: treat custom graph/workflow classes as subgraphs unless explicitly a Loop.
     if (normalized.endsWith('Workflow')) return true;
-    if (normalized.endsWith('Graph')) return !isLoopType(normalized, templates);
+    if (normalized.endsWith('Graph')) return !isLoopType(normalized, templates, localClassBases);
     return false;
 }
 
@@ -87,6 +140,17 @@ export interface NodeParseContext {
     // Best-effort literal bindings for declarative graphs (e.g., sub_nodes = [...], sub_edges = [...])
     // Used to resolve identifier references inside nodes=[...] / edges=[...] literals.
     literalValues?: { [name: string]: TSNode };
+    // Local class inheritance graph for resolving Graph-vs-Loop custom classes.
+    localClassBases?: { [name: string]: string[] };
+    // Best-effort resolver for template-like expressions beyond direct NodeTemplate(...),
+    // such as `.clone(...)` and factory functions returning NodeTemplate instances.
+    resolveTemplateAssignment?: (
+        leftText: string,
+        callNode: TSNode,
+        code: string,
+        templates?: { [name: string]: ParsedNodeTemplate },
+        literalValues?: { [name: string]: TSNode }
+    ) => ParsedNodeTemplate | null;
     // Line offset for reparsed code (used in builder function parsing)
     lineOffset?: number;
     /**
@@ -116,7 +180,57 @@ function getKeywordArgMap(
     return map;
 }
 
-function extractNodeTypeFromCreateNodeArgs(args: TSNode[], code: string): string {
+function getExpandedDictNode(
+    arg: TSNode,
+    code: string,
+    literalValues?: { [name: string]: TSNode }
+): TSNode | null {
+    const raw = getNodeText(arg, code).trim();
+    if (!raw.startsWith('**')) return null;
+
+    const inlineDict = arg.namedChildren.find((child): child is TSNode => !!child && child.type === 'dictionary');
+    if (inlineDict) return inlineDict;
+
+    const expr = raw.slice(2).trim();
+    if (!expr || !literalValues) return null;
+    return literalValues[expr] && literalValues[expr].type === 'dictionary' ? literalValues[expr] : null;
+}
+
+function getExpandedKeywordArgValue(
+    args: TSNode[],
+    code: string,
+    names: string[],
+    literalValues?: { [name: string]: TSNode }
+): TSNode | null {
+    const kw = getKeywordArgMap(args, code);
+    for (const name of names) {
+        const direct = kw.get(name);
+        if (direct) return direct;
+    }
+
+    for (const arg of args) {
+        const expanded = getExpandedDictNode(arg, code, literalValues);
+        if (!expanded) continue;
+        for (const child of expanded.namedChildren) {
+            if (!child || child.type !== 'pair') continue;
+            const keyNode = child.childForFieldName('key');
+            const valueNode = child.childForFieldName('value');
+            if (!keyNode || !valueNode) continue;
+            const keyText = getNodeText(keyNode, code).replace(/^["']|["']$/g, '');
+            if (names.includes(keyText)) {
+                return valueNode;
+            }
+        }
+    }
+
+    return null;
+}
+
+function extractNodeTypeFromCreateNodeArgs(
+    args: TSNode[],
+    code: string,
+    literalValues?: { [name: string]: TSNode }
+): string {
     const positional = getPositionalArgs(args);
     // Common: create_node(NodeType, ...)
     if (positional.length > 0) {
@@ -129,8 +243,7 @@ function extractNodeTypeFromCreateNodeArgs(args: TSNode[], code: string): string
     }
 
     // Also support keyword style: create_node(cls=NodeType, ...) / create_node(node_type=NodeType, ...)
-    const kw = getKeywordArgMap(args, code);
-    const clsNode = kw.get('cls') || kw.get('node_type');
+    const clsNode = getExpandedKeywordArgValue(args, code, ['cls', 'node_type'], literalValues);
     if (clsNode) {
         return getNodeText(clsNode, code).trim();
     }
@@ -141,10 +254,10 @@ function extractNodeTypeFromCreateNodeArgs(args: TSNode[], code: string): string
 function extractNodeNameFromArgs(
     args: TSNode[],
     code: string,
-    fallbackName: string
+    fallbackName: string,
+    literalValues?: { [name: string]: TSNode }
 ): string {
-    const kw = getKeywordArgMap(args, code);
-    const nameNode = kw.get('name');
+    const nameNode = getExpandedKeywordArgValue(args, code, ['name'], literalValues);
     if (nameNode) {
         return extractNodeNameFromExpression(nameNode, code, fallbackName);
     }
@@ -261,8 +374,8 @@ export function parseCreateNode(
     const fallbackBaseName = variableName.replace('self._', '').replace('self.', '');
 
     // Extract node type and base name (support positional + keyword styles)
-    const nodeType = extractNodeTypeFromCreateNodeArgs(args, code);
-    const rawNodeName = extractNodeNameFromArgs(args, code, fallbackBaseName);
+    const nodeType = extractNodeTypeFromCreateNodeArgs(args, code, ctx.literalValues);
+    const rawNodeName = extractNodeNameFromArgs(args, code, fallbackBaseName, ctx.literalValues);
 
     // Namespace node names by parent graph to avoid collisions across subgraphs.
     // MASFactory allows identical node names in different Graph/Loop instances.
@@ -278,20 +391,19 @@ export function parseCreateNode(
     ctx.variableToNodeName[variableName] = nodeName;
 
     // Parse other keyword params using the final, namespaced nodeName
-    const kw = getKeywordArgMap(args, code);
-    const pullKeysNode = kw.get('pull_keys');
+    const pullKeysNode = getExpandedKeywordArgValue(args, code, ['pull_keys'], ctx.literalValues);
     if (pullKeysNode) {
         ctx.nodePullKeys[nodeName] = parseKeysArgument(pullKeysNode, code);
     }
-    const pushKeysNode = kw.get('push_keys');
+    const pushKeysNode = getExpandedKeywordArgValue(args, code, ['push_keys'], ctx.literalValues);
     if (pushKeysNode) {
         ctx.nodePushKeys[nodeName] = parseKeysArgument(pushKeysNode, code);
     }
-    const attributesNode = kw.get('attributes');
+    const attributesNode = getExpandedKeywordArgValue(args, code, ['attributes'], ctx.literalValues);
     if (attributesNode) {
         ctx.nodeAttributes[nodeName] = parseDictArgument(attributesNode, code);
     }
-    const buildFuncNode = kw.get('build_func');
+    const buildFuncNode = getExpandedKeywordArgValue(args, code, ['build_func'], ctx.literalValues);
     if (buildFuncNode) {
         const buildFuncInfo = parseBuildFuncArgument(buildFuncNode, code);
         if (buildFuncInfo) {
@@ -325,7 +437,7 @@ export function parseCreateNode(
         }
         
         // Add internal nodes based on graph type
-        if (isLoopType(nodeType, ctx.templates)) {
+        if (isLoopType(nodeType, ctx.templates, ctx.localClassBases)) {
             // Loop-based types have controller and terminate internal nodes
             const controllerName = `${nodeName}_controller`;
             const terminateName = `${nodeName}_terminate`;
@@ -350,7 +462,7 @@ export function parseCreateNode(
                     ctx.subgraphParents[terminateName] = nodeName;
                 }
             }
-        } else if (isGraphType(nodeType, ctx.templates)) {
+        } else if (isGraphType(nodeType, ctx.templates, ctx.localClassBases)) {
             // Graph-based types have entry and exit internal nodes
             const entryName = `${nodeName}_entry`;
             const exitName = `${nodeName}_exit`;
@@ -412,7 +524,10 @@ export function parseCreateNodeWithRootGraph(
     } else if (ctx.variableToNodeName[parentVar]) {
         parentGraph = ctx.variableToNodeName[parentVar];
     } else {
-        parentGraph = parentVar;
+        // Ignore create_node() calls rooted at unrelated top-level graph variables.
+        // This keeps standalone multi-graph files isolated when the preview selects
+        // one root graph candidate at a time.
+        return;
     }
     
     // Get arguments
@@ -423,8 +538,8 @@ export function parseCreateNodeWithRootGraph(
     if (args.length === 0) return;
 
     // Extract node type and base name (support positional + keyword styles)
-    const nodeType = extractNodeTypeFromCreateNodeArgs(args, code);
-    const rawNodeName = extractNodeNameFromArgs(args, code, variableName);
+    const nodeType = extractNodeTypeFromCreateNodeArgs(args, code, ctx.literalValues);
+    const rawNodeName = extractNodeNameFromArgs(args, code, variableName, ctx.literalValues);
 
     // Namespace by parent graph to avoid collisions across subgraphs
     let nodeName = parentGraph ? `${parentGraph}_${rawNodeName}` : rawNodeName;
@@ -437,16 +552,15 @@ export function parseCreateNodeWithRootGraph(
     ctx.variableToNodeName[variableName] = nodeName;
 
     // Parse other keyword params using the final nodeName
-    const kw = getKeywordArgMap(args, code);
-    const pullKeysNode = kw.get('pull_keys');
+    const pullKeysNode = getExpandedKeywordArgValue(args, code, ['pull_keys'], ctx.literalValues);
     if (pullKeysNode) {
         ctx.nodePullKeys[nodeName] = parseKeysArgument(pullKeysNode, code);
     }
-    const pushKeysNode = kw.get('push_keys');
+    const pushKeysNode = getExpandedKeywordArgValue(args, code, ['push_keys'], ctx.literalValues);
     if (pushKeysNode) {
         ctx.nodePushKeys[nodeName] = parseKeysArgument(pushKeysNode, code);
     }
-    const attributesNode = kw.get('attributes');
+    const attributesNode = getExpandedKeywordArgValue(args, code, ['attributes'], ctx.literalValues);
     if (attributesNode) {
         ctx.nodeAttributes[nodeName] = parseDictArgument(attributesNode, code);
     }
@@ -467,7 +581,7 @@ export function parseCreateNodeWithRootGraph(
         }
         
         // Add internal nodes based on graph type
-        if (isLoopType(nodeType, ctx.templates)) {
+        if (isLoopType(nodeType, ctx.templates, ctx.localClassBases)) {
             // Loop-based types have controller and terminate internal nodes
             const controllerName = `${nodeName}_controller`;
             const terminateName = `${nodeName}_terminate`;
@@ -490,7 +604,7 @@ export function parseCreateNodeWithRootGraph(
                 ctx.subgraphParents[controllerName] = nodeName;
                 ctx.subgraphParents[terminateName] = nodeName;
             }
-        } else if (isGraphType(nodeType, ctx.templates)) {
+        } else if (isGraphType(nodeType, ctx.templates, ctx.localClassBases)) {
             // Graph-based types have entry and exit internal nodes
             const entryName = `${nodeName}_entry`;
             const exitName = `${nodeName}_exit`;

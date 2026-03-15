@@ -7,8 +7,22 @@ import type { Node as TSNode } from 'web-tree-sitter';
 import { getNodeText } from './astUtils';
 
 function isRootGraphCallee(functionText: string): boolean {
-    // Accept RootGraph(...) and qualified forms like masfactory.RootGraph(...)
-    return functionText === 'RootGraph' || functionText.endsWith('.RootGraph');
+    // Accept RootGraph(...), Graph(...), Loop(...) and qualified forms like masfactory.RootGraph(...).
+    return (
+        functionText === 'RootGraph' ||
+        functionText.endsWith('.RootGraph') ||
+        functionText === 'Graph' ||
+        functionText.endsWith('.Graph') ||
+        functionText === 'Loop' ||
+        functionText.endsWith('.Loop')
+    );
+}
+
+function getGraphCalleeRank(functionText: string): number {
+    if (functionText === 'RootGraph' || functionText.endsWith('.RootGraph')) return 3;
+    if (functionText === 'Loop' || functionText.endsWith('.Loop')) return 2;
+    if (functionText === 'Graph' || functionText.endsWith('.Graph')) return 1;
+    return 0;
 }
 
 function isAssignmentNode(node: TSNode): boolean {
@@ -30,7 +44,9 @@ export interface FunctionWithRootGraph {
 export function findRootGraphVariable(rootNode: TSNode, code: string): string {
     // Recursively search module-level statements (including if-blocks),
     // but do NOT descend into function/class definitions.
-    function searchStatements(node: TSNode): string {
+    function searchStatements(node: TSNode): { name: string; rank: number } | null {
+        let best: { name: string; rank: number } | null = null;
+
         for (const child of node.children) {
             if (!child) continue;
             if (child.type === 'function_definition' || child.type === 'class_definition') {
@@ -48,7 +64,14 @@ export function findRootGraphVariable(rootNode: TSNode, code: string): string {
                             if (isRootGraphCallee(funcText)) {
                                 const leftSide = firstChild.childForFieldName('left');
                                 if (leftSide) {
-                                    return getNodeText(leftSide, code);
+                                    const rank = getGraphCalleeRank(funcText);
+                                    const candidate = { name: getNodeText(leftSide, code), rank };
+                                    if (!best || candidate.rank > best.rank) {
+                                        best = candidate;
+                                    }
+                                    if (candidate.rank >= 3) {
+                                        return best;
+                                    }
                                 }
                             }
                         }
@@ -61,7 +84,8 @@ export function findRootGraphVariable(rootNode: TSNode, code: string): string {
                 const body = child.childForFieldName('body');
                 if (body) {
                     const found = searchStatements(body);
-                    if (found) return found;
+                    if (found && (!best || found.rank > best.rank)) best = found;
+                    if (best?.rank === 3) return best;
                 }
 
                 for (const clause of child.namedChildren) {
@@ -75,7 +99,8 @@ export function findRootGraphVariable(rootNode: TSNode, code: string): string {
                         null;
                     if (clauseBody) {
                         const found = searchStatements(clauseBody);
-                        if (found) return found;
+                        if (found && (!best || found.rank > best.rank)) best = found;
+                        if (best?.rank === 3) return best;
                     }
                 }
             }
@@ -84,24 +109,27 @@ export function findRootGraphVariable(rootNode: TSNode, code: string): string {
                 const body = child.childForFieldName('body') || child.childForFieldName('consequence');
                 if (body) {
                     const found = searchStatements(body);
-                    if (found) return found;
+                    if (found && (!best || found.rank > best.rank)) best = found;
+                    if (best?.rank === 3) return best;
                 }
                 const alternative = child.childForFieldName('alternative');
                 if (alternative) {
                     const found = searchStatements(alternative);
-                    if (found) return found;
+                    if (found && (!best || found.rank > best.rank)) best = found;
+                    if (best?.rank === 3) return best;
                 }
             }
 
             if (child.type === 'block') {
                 const found = searchStatements(child);
-                if (found) return found;
+                if (found && (!best || found.rank > best.rank)) best = found;
+                if (best?.rank === 3) return best;
             }
         }
-        return '';
+        return best;
     }
 
-    return searchStatements(rootNode);
+    return searchStatements(rootNode)?.name || '';
 }
 
 /**
@@ -135,6 +163,8 @@ export function findFunctionWithRootGraph(
         }
     }
 
+    let best: (FunctionWithRootGraph & { rank: number }) | null = null;
+
     for (const funcNode of functionNodes) {
         const nameNode = funcNode.childForFieldName('name');
         const body = funcNode.childForFieldName('body');
@@ -142,7 +172,7 @@ export function findFunctionWithRootGraph(
 
         const funcName = nameNode.text;
 
-        // Search for RootGraph in function body (top-level assignments)
+        // Search for graph constructor assignments in function body and prefer RootGraph over Graph/Loop.
         for (const stmt of body.children) {
             if (!stmt) continue;
             if (stmt.type !== 'expression_statement') continue;
@@ -161,12 +191,29 @@ export function findFunctionWithRootGraph(
             const leftSide = firstChild.childForFieldName('left');
             if (!leftSide) continue;
 
-            return {
+            const candidate: FunctionWithRootGraph & { rank: number } = {
                 funcName,
                 funcBody: body,
-                rootGraphVar: getNodeText(leftSide, code)
+                rootGraphVar: getNodeText(leftSide, code),
+                rank: getGraphCalleeRank(funcText)
             };
+            if (!best || candidate.rank > best.rank) {
+                best = candidate;
+            }
+            if (candidate.rank >= 3) {
+                return {
+                    funcName: candidate.funcName,
+                    funcBody: candidate.funcBody,
+                    rootGraphVar: candidate.rootGraphVar
+                };
+            }
         }
     }
-    return null;
+    return best
+        ? {
+              funcName: best.funcName,
+              funcBody: best.funcBody,
+              rootGraphVar: best.rootGraphVar
+          }
+        : null;
 }

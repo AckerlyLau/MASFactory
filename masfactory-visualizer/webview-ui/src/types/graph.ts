@@ -44,4 +44,6 @@ export interface GraphData {
   // Standalone NodeTemplate preview support (multiple templates in one file)
   templateCandidates?: string[];
   selectedTemplate?: string;
+  graphCandidates?: string[];
+  selectedGraph?: string;
 }

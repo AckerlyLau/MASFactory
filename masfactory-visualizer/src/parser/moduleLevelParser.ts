@@ -4,7 +4,7 @@
  * Parses module-level and function-level graph definitions (without class).
  */
 import type { Node as TSNode } from 'web-tree-sitter';
-import { getNodeText } from './astUtils';
+import { extractMethodCall, getNodeText } from './astUtils';
 import { parseCreateNodeWithRootGraph, NodeParseContext } from './nodeParser';
 import { parseEdgeCreation, EdgeParseContext } from './edgeParser';
 import { findEdgeCreationCall } from './chainedCallParser';
@@ -14,6 +14,85 @@ import { tryParseNodeTemplateAssignment } from './templateParser';
 
 function isAssignmentNode(node: TSNode | null | undefined): node is TSNode {
     return !!node && (node.type === 'assignment' || node.type === 'typed_assignment');
+}
+
+function createSyntheticListNode(items: TSNode[], fallback?: TSNode | null): TSNode {
+    const first = items[0] || fallback || null;
+    const last = items[items.length - 1] || fallback || null;
+    const startPosition = first?.startPosition ?? { row: 0, column: 0 };
+    const endPosition = last?.endPosition ?? startPosition;
+    return {
+        type: 'list',
+        children: items,
+        namedChildren: items,
+        startPosition,
+        endPosition
+    } as unknown as TSNode;
+}
+
+function storeLiteralBinding(literalValues: { [name: string]: TSNode }, rawKey: string, value: TSNode): void {
+    const store = (key: string) => {
+        if (!key) return;
+        literalValues[key] = value;
+    };
+
+    const key = rawKey.trim();
+    if (!key) return;
+
+    store(key);
+    if (key.startsWith('self._')) store(key.replace('self._', ''));
+    if (key.startsWith('self.')) store(key.replace('self.', ''));
+
+    const last = key.split('.').pop();
+    if (last) store(last);
+    if (last?.startsWith('_')) store(last.slice(1));
+}
+
+function resolveLiteralBinding(literalValues: { [name: string]: TSNode }, rawKey: string): TSNode | null {
+    const key = rawKey.trim();
+    if (!key) return null;
+
+    return (
+        literalValues[key] ||
+        (key.startsWith('self._') ? literalValues[key.replace('self._', '')] : null) ||
+        (key.startsWith('self.') ? literalValues[key.replace('self.', '')] : null) ||
+        literalValues[key.split('.').pop() || ''] ||
+        null
+    );
+}
+
+function extractListItemsFromLiteral(node: TSNode | null | undefined): TSNode[] {
+    if (!node) return [];
+    if (node.type !== 'list') return [];
+    return node.namedChildren.filter((child): child is TSNode => !!child && child.type !== 'comment');
+}
+
+function shouldParseEdgeForRootGraph(
+    functionText: string,
+    nodeCtx: NodeParseContext,
+    rootGraphVariable: string
+): boolean {
+    const methodCall = extractMethodCall(functionText);
+    if (!methodCall) return false;
+    const caller = String(methodCall.caller || '').trim();
+    if (!caller) return false;
+    if (caller === rootGraphVariable) return true;
+    return !!nodeCtx.variableToNodeName[caller];
+}
+
+function extendLiteralList(
+    literalValues: { [name: string]: TSNode },
+    targetKey: string,
+    items: TSNode[]
+): boolean {
+    if (items.length === 0) return false;
+
+    const existing = resolveLiteralBinding(literalValues, targetKey);
+    if (!existing || existing.type !== 'list') return false;
+
+    const merged = [...extractListItemsFromLiteral(existing), ...items];
+    storeLiteralBinding(literalValues, targetKey, createSyntheticListNode(merged, existing));
+    return true;
 }
 
 /**
@@ -270,16 +349,7 @@ function parseAssignmentWithRootGraph(
     if (rightSide.type !== 'call') {
         const leftText = getNodeText(leftSide, code).trim();
         if (leftText && (rightSide.type === 'list' || rightSide.type === 'tuple' || rightSide.type === 'dictionary')) {
-            const store = (key: string) => {
-                if (!key) return;
-                nodeCtx.literalValues![key] = rightSide;
-            };
-            store(leftText);
-            if (leftText.startsWith('self._')) store(leftText.replace('self._', ''));
-            if (leftText.startsWith('self.')) store(leftText.replace('self.', ''));
-            const last = leftText.split('.').pop();
-            if (last) store(last);
-            if (last && last.startsWith('_')) store(last.slice(1));
+            storeLiteralBinding(nodeCtx.literalValues!, leftText, rightSide);
         }
 
         // Handle simple variable aliasing: node_b = node_a (or self._node_b = node_a)
@@ -312,20 +382,32 @@ function parseAssignmentWithRootGraph(
         if (!functionNode) return;
 
         const functionText = getNodeText(functionNode, code);
+        const leftText = getNodeText(leftSide, code).trim();
 
         // Track local NodeTemplate assignments for later type resolution (declarative graphs)
         if (functionText === 'NodeTemplate' || functionText.endsWith('.NodeTemplate')) {
-            const leftText = getNodeText(leftSide, code).trim();
             const parsed = tryParseNodeTemplateAssignment(leftText, rightSide, code);
             if (parsed) {
                 if (!nodeCtx.templates) nodeCtx.templates = {};
                 nodeCtx.templates[parsed.templateName] = parsed;
             }
+        } else if (nodeCtx.resolveTemplateAssignment) {
+            const resolved = nodeCtx.resolveTemplateAssignment(
+                leftText,
+                rightSide,
+                code,
+                nodeCtx.templates,
+                nodeCtx.literalValues
+            );
+            if (resolved) {
+                if (!nodeCtx.templates) nodeCtx.templates = {};
+                nodeCtx.templates[resolved.templateName] = resolved;
+            }
         }
 
         // Declarative RootGraph(..., nodes=[...], edges=[...])
-        const leftText = getNodeText(leftSide, code).trim();
         if (leftText === rootGraphVariable && isDeclarativeGraphCall(functionText)) {
+            const normalizedRootKind = functionText.includes('.') ? functionText.split('.').pop()! : functionText;
             parseDeclarativeGraphCallIntoContexts(
                 rightSide,
                 code,
@@ -333,7 +415,15 @@ function parseAssignmentWithRootGraph(
                 edgeCtx,
                 subgraphs,
                 nodeCtx.templates,
-                { isRootGraph: true }
+                {
+                    isRootGraph: true,
+                    rootKind:
+                        normalizedRootKind === 'Loop'
+                            ? 'Loop'
+                            : normalizedRootKind === 'RootGraph'
+                                ? 'RootGraph'
+                                : 'Graph'
+                }
             );
             return;
         }
@@ -347,7 +437,9 @@ function parseAssignmentWithRootGraph(
                 const edgeFunctionNode = edgeCall.childForFieldName('function');
                 if (edgeFunctionNode) {
                     const edgeFunctionText = getNodeText(edgeFunctionNode, code);
-                    parseEdgeCreation(edgeCall, code, edgeCtx, edgeFunctionText);
+                    if (shouldParseEdgeForRootGraph(edgeFunctionText, nodeCtx, rootGraphVariable)) {
+                        parseEdgeCreation(edgeCall, code, edgeCtx, edgeFunctionText);
+                    }
                 }
             }
         }
@@ -372,6 +464,39 @@ function parseExpressionStatementWithRootGraph(
     const functionNode = callNode.childForFieldName('function');
     if (functionNode) {
         const functionText = getNodeText(functionNode, code);
+        if (functionText.endsWith('.append') || functionText.endsWith('.extend')) {
+            const receiverNode = functionNode.childForFieldName('object');
+            const argsNode = callNode.childForFieldName('arguments');
+            const targetKey = receiverNode ? getNodeText(receiverNode, code).trim() : functionText.replace(/\.(append|extend)$/, '');
+            const args = argsNode?.namedChildren.filter((arg): arg is TSNode => !!arg && arg.type !== 'comment') || [];
+            const positional = args.filter((arg) => arg.type !== 'keyword_argument');
+            const firstArg = positional[0];
+
+            if (targetKey && firstArg) {
+                if (functionText.endsWith('.append')) {
+                    let appendedNode = firstArg;
+                    if (firstArg.type === 'identifier' || firstArg.type === 'attribute') {
+                        appendedNode = resolveLiteralBinding(nodeCtx.literalValues || {}, getNodeText(firstArg, code).trim()) || firstArg;
+                    }
+                    if (appendedNode.type === 'tuple') {
+                        if (extendLiteralList(nodeCtx.literalValues || {}, targetKey, [appendedNode])) return;
+                    } else if (appendedNode.type === 'list') {
+                        if (extendLiteralList(nodeCtx.literalValues || {}, targetKey, extractListItemsFromLiteral(appendedNode))) return;
+                    }
+                }
+
+                if (functionText.endsWith('.extend')) {
+                    let sourceNode = firstArg;
+                    if (firstArg.type === 'identifier' || firstArg.type === 'attribute') {
+                        sourceNode = resolveLiteralBinding(nodeCtx.literalValues || {}, getNodeText(firstArg, code).trim()) || firstArg;
+                    }
+                    if (sourceNode.type === 'list') {
+                        if (extendLiteralList(nodeCtx.literalValues || {}, targetKey, extractListItemsFromLiteral(sourceNode))) return;
+                    }
+                }
+            }
+        }
+
         if (functionText.endsWith('.create_node')) {
             // Synthesize a stable name from "name=" or the positional name argument.
             // This is useful for patterns like: root.create_node(..., name="X", ...)
@@ -443,10 +568,11 @@ function parseExpressionStatementWithRootGraph(
     // Handle chained calls
     const edgeCall = findEdgeCreationCall(callNode);
     if (edgeCall) {
-        const functionNode = edgeCall.childForFieldName('function');
-        if (functionNode) {
-            const functionText = getNodeText(functionNode, code);
-            parseEdgeCreation(edgeCall, code, edgeCtx, functionText);
+        const edgeFunctionNode = edgeCall.childForFieldName('function');
+        if (!edgeFunctionNode) return;
+        const edgeFunctionText = getNodeText(edgeFunctionNode, code);
+        if (shouldParseEdgeForRootGraph(edgeFunctionText, nodeCtx, rootGraphVariable)) {
+            parseEdgeCreation(edgeCall, code, edgeCtx, edgeFunctionText);
         }
     }
 }

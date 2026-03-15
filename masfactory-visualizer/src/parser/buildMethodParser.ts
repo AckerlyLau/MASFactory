@@ -34,18 +34,17 @@ export function findBuildMethodAndBaseType(node: TSNode): BuildMethodInfo {
         const bases = getBaseClasses(classNode);
         const nameNode = classNode.childForFieldName('name');
         const currentClassName = nameNode ? nameNode.text : '';
+        let candidateBaseType: string = BASE_TYPES.NONE;
         
         // Check if this class inherits from a graph base type
         for (const base of bases) {
             if (GRAPH_BASE_TYPES.some(t => base.includes(t))) {
-                className = currentClassName;
-                
                 if (base.includes('Loop')) {
-                    baseType = BASE_TYPES.LOOP;
+                    candidateBaseType = BASE_TYPES.LOOP;
                 } else if (base.includes('RootGraph')) {
-                    baseType = BASE_TYPES.ROOT_GRAPH;
+                    candidateBaseType = BASE_TYPES.ROOT_GRAPH;
                 } else if (base.includes('Graph')) {
-                    baseType = BASE_TYPES.GRAPH;
+                    candidateBaseType = BASE_TYPES.GRAPH;
                 }
                 
                 // Find build method in this class
@@ -75,7 +74,11 @@ export function findBuildMethodAndBaseType(node: TSNode): BuildMethodInfo {
                     }
                 }
                 
-                if (buildMethod) break;
+                if (buildMethod) {
+                    className = currentClassName;
+                    baseType = candidateBaseType;
+                    break;
+                }
             }
         }
         
@@ -446,6 +449,18 @@ function parseAssignment(
         const parsed = tryParseNodeTemplateAssignment(leftText, rightSide, code);
         if (parsed) {
             nodeCtx.templates[parsed.templateName] = parsed;
+        }
+    } else if (nodeCtx.resolveTemplateAssignment) {
+        const leftText = getNodeText(leftSide, code).trim();
+        const resolved = nodeCtx.resolveTemplateAssignment(
+            leftText,
+            rightSide,
+            code,
+            nodeCtx.templates,
+            nodeCtx.literalValues
+        );
+        if (resolved) {
+            nodeCtx.templates[resolved.templateName] = resolved;
         }
     }
 

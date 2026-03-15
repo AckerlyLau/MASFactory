@@ -24,12 +24,17 @@ export interface ParsedNodeTemplate {
     templateName: string;
     nodeClass: string;
     baseKind: TemplateBaseKind;
+    lineNumber?: number;
     buildFunc?: ParsedBuildFuncInfo;
     nodesArg?: TSNode;
     edgesArg?: TSNode;
     pullKeys?: { [key: string]: string } | null | 'empty';
     pushKeys?: { [key: string]: string } | null | 'empty';
     attributes?: { [key: string]: any } | null;
+    scopedTemplates?: { [name: string]: ParsedNodeTemplate };
+    literalValues?: { [name: string]: TSNode };
+    sourceFilePath?: string;
+    sourceCode?: string;
 }
 
 function getCallArgs(callNode: TSNode): TSNode[] {
@@ -139,7 +144,8 @@ export function tryParseNodeTemplateAssignment(
     const out: ParsedNodeTemplate = {
         templateName: leftVarText,
         nodeClass,
-        baseKind
+        baseKind,
+        lineNumber: callNode.startPosition.row + 1
     };
 
     if (nodesArg) out.nodesArg = nodesArg;

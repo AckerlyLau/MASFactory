@@ -214,7 +214,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         if (resolvedView === 'vibe' && isJsonLang(doc.languageId)) {
             this.setLastActiveVibeDocument(doc);
             this.updateVibeDocument(doc);
-            this.postToAllWebviews({ type: 'uiSetActiveTab', tab: 'vibe' });
+            this.postToAllWebviews({ type: 'uiSetActiveTab', tab: 'drag' });
         } else {
             this.setLastActivePythonDocument(doc);
             this.updateGraph(doc);

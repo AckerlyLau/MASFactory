@@ -11,6 +11,7 @@ export interface EdgeParseContext {
     variableToNodeName: { [variable: string]: string };
     nodes: string[];
     subgraphParents?: { [key: string]: string };
+    literalValues?: { [name: string]: TSNode };
     // Line offset for reparsed code (used in builder function parsing)
     lineOffset?: number;
     /**
@@ -18,6 +19,52 @@ export interface EdgeParseContext {
      * New parsing behaviors should be guarded behind flags with safe defaults.
      */
     features?: ParserFeatures;
+}
+
+function getExpandedDictNode(
+    arg: TSNode,
+    code: string,
+    literalValues?: { [name: string]: TSNode }
+): TSNode | null {
+    const raw = getNodeText(arg, code).trim();
+    if (!raw.startsWith('**')) return null;
+    const inlineDict = arg.namedChildren.find((child): child is TSNode => !!child && child.type === 'dictionary');
+    if (inlineDict) return inlineDict;
+    const expr = raw.slice(2).trim();
+    if (!expr || !literalValues) return null;
+    return literalValues[expr] && literalValues[expr].type === 'dictionary' ? literalValues[expr] : null;
+}
+
+function getExpandedKeywordValue(
+    args: TSNode[],
+    code: string,
+    key: string,
+    literalValues?: { [name: string]: TSNode }
+): TSNode | null {
+    for (const arg of args) {
+        if (arg.type === 'keyword_argument') {
+            const argName = getNodeText(arg.childForFieldName('name'), code);
+            const argValue = arg.childForFieldName('value');
+            if (argName === key && argValue) {
+                return argValue;
+            }
+            continue;
+        }
+
+        const expanded = getExpandedDictNode(arg, code, literalValues);
+        if (!expanded) continue;
+        for (const child of expanded.namedChildren) {
+            if (!child || child.type !== 'pair') continue;
+            const keyNode = child.childForFieldName('key');
+            const valueNode = child.childForFieldName('value');
+            if (!keyNode || !valueNode) continue;
+            const keyText = getNodeText(keyNode, code).replace(/^["']|["']$/g, '');
+            if (keyText === key) {
+                return valueNode;
+            }
+        }
+    }
+    return null;
 }
 
 type ParsedEdgeInfo = {
@@ -41,6 +88,23 @@ function parseCreateEdge(args: TSNode[], code: string, ctx: EdgeParseContext): P
 
     // create_edge(sender, receiver, keys={...})
     let positionalIndex = 0;
+    const senderNode = getExpandedKeywordValue(args, code, 'sender', ctx.literalValues);
+    if (senderNode) {
+        sender = resolveNodeReference(getNodeText(senderNode, code), ctx.variableToNodeName);
+    }
+    const receiverNode = getExpandedKeywordValue(args, code, 'receiver', ctx.literalValues);
+    if (receiverNode) {
+        receiver = resolveNodeReference(getNodeText(receiverNode, code), ctx.variableToNodeName);
+    }
+    const keysNode = getExpandedKeywordValue(args, code, 'keys', ctx.literalValues);
+    if (keysNode) {
+        const keysDict = parseDictArgument(keysNode, code);
+        if (keysDict) {
+            keys = Object.keys(keysDict);
+            keysDetails = keysDict;
+        }
+    }
+
     for (const arg of args) {
         if (arg.type === 'keyword_argument') {
             const argName = getNodeText(arg.childForFieldName('name'), code);
@@ -91,6 +155,19 @@ function parseEdgeFromEntry(args: TSNode[], code: string, ctx: EdgeParseContext,
         sender = `${subgraphName}_entry`;
     }
 
+    const receiverNode = getExpandedKeywordValue(args, code, 'receiver', ctx.literalValues);
+    if (receiverNode) {
+        receiver = resolveNodeReference(getNodeText(receiverNode, code), ctx.variableToNodeName);
+    }
+    const keysNode = getExpandedKeywordValue(args, code, 'keys', ctx.literalValues);
+    if (keysNode) {
+        const keysDict = parseDictArgument(keysNode, code);
+        if (keysDict) {
+            keys = Object.keys(keysDict);
+            keysDetails = keysDict;
+        }
+    }
+
     for (const arg of args) {
         if (arg.type === 'keyword_argument') {
             const argName = getNodeText(arg.childForFieldName('name'), code);
@@ -132,6 +209,19 @@ function parseEdgeToExit(args: TSNode[], code: string, ctx: EdgeParseContext, fu
     } else {
         const subgraphName = ctx.variableToNodeName[graphVar];
         receiver = `${subgraphName}_exit`;
+    }
+
+    const senderNode = getExpandedKeywordValue(args, code, 'sender', ctx.literalValues);
+    if (senderNode) {
+        sender = resolveNodeReference(getNodeText(senderNode, code), ctx.variableToNodeName);
+    }
+    const keysNode = getExpandedKeywordValue(args, code, 'keys', ctx.literalValues);
+    if (keysNode) {
+        const keysDict = parseDictArgument(keysNode, code);
+        if (keysDict) {
+            keys = Object.keys(keysDict);
+            keysDetails = keysDict;
+        }
     }
 
     for (const arg of args) {
@@ -177,6 +267,19 @@ function parseEdgeFromController(args: TSNode[], code: string, ctx: EdgeParseCon
         sender = `${resolvedLoop}_controller`;
     }
 
+    const receiverNode = getExpandedKeywordValue(args, code, 'receiver', ctx.literalValues);
+    if (receiverNode) {
+        receiver = resolveNodeReference(getNodeText(receiverNode, code), ctx.variableToNodeName);
+    }
+    const keysNode = getExpandedKeywordValue(args, code, 'keys', ctx.literalValues);
+    if (keysNode) {
+        const keysDict = parseDictArgument(keysNode, code);
+        if (keysDict) {
+            keys = Object.keys(keysDict);
+            keysDetails = keysDict;
+        }
+    }
+
     for (const arg of args) {
         if (arg.type === 'keyword_argument') {
             const argName = getNodeText(arg.childForFieldName('name'), code);
@@ -220,6 +323,19 @@ function parseEdgeToController(args: TSNode[], code: string, ctx: EdgeParseConte
         receiver = `${resolvedLoop}_controller`;
     }
 
+    const senderNode = getExpandedKeywordValue(args, code, 'sender', ctx.literalValues);
+    if (senderNode) {
+        sender = resolveNodeReference(getNodeText(senderNode, code), ctx.variableToNodeName);
+    }
+    const keysNode = getExpandedKeywordValue(args, code, 'keys', ctx.literalValues);
+    if (keysNode) {
+        const keysDict = parseDictArgument(keysNode, code);
+        if (keysDict) {
+            keys = Object.keys(keysDict);
+            keysDetails = keysDict;
+        }
+    }
+
     for (const arg of args) {
         if (arg.type === 'keyword_argument') {
             const argName = getNodeText(arg.childForFieldName('name'), code);
@@ -261,6 +377,19 @@ function parseEdgeToTerminateNode(args: TSNode[], code: string, ctx: EdgeParseCo
     } else {
         const resolvedLoop = resolveNodeReference(loopVar, ctx.variableToNodeName);
         receiver = `${resolvedLoop}_terminate`;
+    }
+
+    const senderNode = getExpandedKeywordValue(args, code, 'sender', ctx.literalValues);
+    if (senderNode) {
+        sender = resolveNodeReference(getNodeText(senderNode, code), ctx.variableToNodeName);
+    }
+    const keysNode = getExpandedKeywordValue(args, code, 'keys', ctx.literalValues);
+    if (keysNode) {
+        const keysDict = parseDictArgument(keysNode, code);
+        if (keysDict) {
+            keys = Object.keys(keysDict);
+            keysDetails = keysDict;
+        }
     }
 
     for (const arg of args) {

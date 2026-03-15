@@ -4,7 +4,7 @@
   "publisher": "GammaLab",
   "description": "Visualize, edit, and debug MASFactory workflows in VS Code with realtime graph preview and HITL support.",
   "icon": "media/icon.png",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "repository": {
     "type": "git",
     "url": "https://github.com/BUPT-GAMMA/MASFactory.git"

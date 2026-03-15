@@ -79,6 +79,8 @@ export interface GraphData {
      */
     templateCandidates?: string[];
     selectedTemplate?: string;
+    graphCandidates?: string[];
+    selectedGraph?: string;
 }
 
 /**

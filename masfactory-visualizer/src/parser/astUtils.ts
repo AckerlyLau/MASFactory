@@ -56,6 +56,20 @@ export function getBaseClasses(classNode: TSNode): string[] {
 }
 
 /**
+ * Collect local class -> base class mappings from a module.
+ */
+export function collectClassBases(rootNode: TSNode, code: string): { [name: string]: string[] } {
+    const out: { [name: string]: string[] } = {};
+    for (const classNode of queryNodes(rootNode, 'class_definition')) {
+        const nameNode = classNode.childForFieldName('name');
+        const className = getNodeText(nameNode, code).trim();
+        if (!className) continue;
+        out[className] = getBaseClasses(classNode);
+    }
+    return out;
+}
+
+/**
  * Parse dictionary argument (for keys, pull_keys, push_keys)
  */
 export function parseDictArgument(node: TSNode, code: string): { [key: string]: string } | null {

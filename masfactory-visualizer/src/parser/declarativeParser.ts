@@ -38,7 +38,8 @@ function normalizeTypeName(raw: string): string {
 
 function parseNodeTypeExpression(
     node: TSNode,
-    code: string
+    code: string,
+    templates?: { [name: string]: ParsedNodeTemplate }
 ): { typeText: string; typeIsCall: boolean } {
     if (node.type === 'call') {
         const funcNode = node.childForFieldName('function');
@@ -53,11 +54,30 @@ function parseNodeTypeExpression(
             }
             return { typeText: 'Node', typeIsCall: true };
         }
+        if ((callee === 'Shared' || callee === 'Factory')) {
+            const args = getCallArgs(node);
+            const positional = getPositionalArgs(args);
+            if (positional.length > 0) {
+                return parseNodeTypeExpression(positional[0], code, templates);
+            }
+        }
+        if (callee === 'clone' && funcNode && funcNode.type === 'attribute') {
+            const baseNode =
+                funcNode.childForFieldName('object') ||
+                funcNode.namedChildren.find((n): n is TSNode => !!n) ||
+                null;
+            if (baseNode) return parseNodeTypeExpression(baseNode, code, templates);
+        }
         // Template instantiation: BaseAgent(...) => display "BaseAgent" (without args).
         return { typeText: funcText || 'Node', typeIsCall: true };
     }
 
-    return { typeText: getNodeText(node, code).trim() || 'Node', typeIsCall: false };
+    const raw = getNodeText(node, code).trim() || 'Node';
+    const normalized = raw.includes('.') ? raw.split('.').pop()! : raw;
+    if (templates?.[raw] || templates?.[normalized]) {
+        return { typeText: raw, typeIsCall: false };
+    }
+    return { typeText: raw, typeIsCall: false };
 }
 
 function resolveLiteralNode(
@@ -171,7 +191,8 @@ function parseEdgeKeysArgument(
 function parseNodesListLiteral(
     node: TSNode,
     code: string,
-    literalValues?: LiteralValues
+    literalValues?: LiteralValues,
+    templates?: { [name: string]: ParsedNodeTemplate }
 ): Array<{ name: string; typeText: string; typeIsCall: boolean; args: TSNode[]; lineNumber: number }> {
     node = resolveLiteralNode(node, code, literalValues);
     if (node.type !== 'list') return [];
@@ -183,7 +204,7 @@ function parseNodesListLiteral(
         if (elems.length < 2) continue;
         const name = parseStringLiteral(elems[0], code);
         if (!name) continue;
-        const typeSpec = parseNodeTypeExpression(elems[1], code);
+        const typeSpec = parseNodeTypeExpression(elems[1], code, templates);
         const args = elems.slice(2);
         out.push({ name, typeText: typeSpec.typeText, typeIsCall: typeSpec.typeIsCall, args, lineNumber: item.startPosition.row + 1 });
     }
@@ -387,16 +408,27 @@ function expandContainerFromDeclarativeLists(
     const prefix = `${containerName}_`;
 
     if (nodesNode) {
-        const specs = parseNodesListLiteral(nodesNode, code, literalValues);
+        const scopedTemplates = {
+            ...(templates || {})
+        };
+        const specs = parseNodesListLiteral(nodesNode, code, literalValues, scopedTemplates);
         for (const spec of specs) {
             const fullName = `${prefix}${spec.name}`;
             addNodeIfMissing(fullName, spec.typeText || 'Node', spec.lineNumber, nodeCtx);
             ensureSubgraphMembership(containerName, fullName, subgraphs, nodeCtx.subgraphParents || (nodeCtx.subgraphParents = {}));
 
-            const templateInfo = ensureNodeDefaults(fullName, spec.typeText || 'Node', nodeCtx, templates);
+            const templateInfo = ensureNodeDefaults(fullName, spec.typeText || 'Node', nodeCtx, scopedTemplates);
             setNodeTypeLabel(fullName, spec.typeText || 'Node', spec.typeIsCall, templateInfo, nodeCtx);
 
-            const childKind = inferContainerKind(spec.typeText, templates);
+            const childTemplates = {
+                ...scopedTemplates,
+                ...(templateInfo?.scopedTemplates || {})
+            };
+            const childLiteralValues = {
+                ...(literalValues || {}),
+                ...(templateInfo?.literalValues || {})
+            };
+            const childKind = inferContainerKind(spec.typeText, childTemplates);
             if (childKind) {
                 addContainerInternalNodes(fullName, childKind, spec.lineNumber, nodeCtx, subgraphs);
 
@@ -411,12 +443,12 @@ function expandContainerFromDeclarativeLists(
                         nodeCtx,
                         edgeCtx,
                         subgraphs,
-                        templates,
-                        literalValues,
+                        childTemplates,
+                        childLiteralValues,
                         visited
                     );
                 } else if (spec.args && spec.args.length > 0) {
-                    const extracted = extractContainerListsFromArgs(spec.args, code, literalValues);
+                    const extracted = extractContainerListsFromArgs(spec.args, code, childLiteralValues);
                     if (extracted.nodesNode || extracted.edgesNode) {
                         expandContainerFromDeclarativeLists(
                             fullName,
@@ -427,8 +459,8 @@ function expandContainerFromDeclarativeLists(
                             nodeCtx,
                             edgeCtx,
                             subgraphs,
-                            templates,
-                            literalValues,
+                            childTemplates,
+                            childLiteralValues,
                             visited
                         );
                     }
@@ -476,16 +508,34 @@ export function parseDeclarativeGraphCallIntoContexts(
     edgeCtx: EdgeParseContext,
     subgraphs: { [parent: string]: string[] },
     templates?: { [name: string]: ParsedNodeTemplate },
-    opts?: { isRootGraph?: boolean }
+    opts?: { isRootGraph?: boolean; rootKind?: 'RootGraph' | 'Graph' | 'Loop' }
 ): void {
     const args = getCallArgs(callNode);
     const kw = getKeywordArgMap(args, code);
+    const positional = getPositionalArgs(args);
+    const rootKind = opts?.rootKind === 'Loop' ? 'Loop' : 'Graph';
 
-    const nodesArg = kw.get('nodes');
-    const edgesArg = kw.get('edges');
+    const extractedFromPositional =
+        !kw.has('nodes') || !kw.has('edges')
+            ? extractContainerListsFromArgs(positional, code, nodeCtx.literalValues)
+            : {};
+
+    const nodesArg = kw.get('nodes') ?? (extractedFromPositional as any).nodesNode;
+    const edgesArg = kw.get('edges') ?? (extractedFromPositional as any).edgesNode;
+
+    if (opts?.isRootGraph && opts.rootKind === 'Loop') {
+        const retainedNodes = nodeCtx.nodes.filter((name) => name !== 'entry' && name !== 'exit');
+        nodeCtx.nodes.splice(0, nodeCtx.nodes.length, ...retainedNodes);
+        delete nodeCtx.nodeTypes.entry;
+        delete nodeCtx.nodeTypes.exit;
+        if (!nodeCtx.nodes.includes('controller')) nodeCtx.nodes.unshift('controller');
+        if (!nodeCtx.nodes.includes('terminate')) nodeCtx.nodes.push('terminate');
+        nodeCtx.nodeTypes.controller = 'Controller';
+        nodeCtx.nodeTypes.terminate = 'TerminateNode';
+    }
 
     if (nodesArg) {
-        const nodeSpecs = parseNodesListLiteral(nodesArg, code, nodeCtx.literalValues);
+        const nodeSpecs = parseNodesListLiteral(nodesArg, code, nodeCtx.literalValues, templates);
         const visited = new Set<string>();
         for (const spec of nodeSpecs) {
             addNodeIfMissing(spec.name, spec.typeText || 'Node', spec.lineNumber, nodeCtx);
@@ -494,7 +544,15 @@ export function parseDeclarativeGraphCallIntoContexts(
             setNodeTypeLabel(spec.name, spec.typeText || 'Node', spec.typeIsCall, templateInfo, nodeCtx);
 
             // Internal structure markers (entry/exit/controller/terminate)
-            const kind = inferContainerKind(spec.typeText, templates);
+            const childTemplates = {
+                ...(templates || {}),
+                ...(templateInfo?.scopedTemplates || {})
+            };
+            const childLiteralValues = {
+                ...(nodeCtx.literalValues || {}),
+                ...(templateInfo?.literalValues || {})
+            };
+            const kind = inferContainerKind(spec.typeText, childTemplates);
             if (kind) {
                 addContainerInternalNodes(spec.name, kind, spec.lineNumber, nodeCtx, subgraphs);
 
@@ -503,7 +561,7 @@ export function parseDeclarativeGraphCallIntoContexts(
                 // - Direct class usage: (name, Graph/Loop, ..., edges_list, nodes_list)
                 const extractedFromArgs =
                     !templateInfo?.nodesArg && !templateInfo?.edgesArg && spec.args?.length
-                        ? extractContainerListsFromArgs(spec.args, code, nodeCtx.literalValues)
+                        ? extractContainerListsFromArgs(spec.args, code, childLiteralValues)
                         : {};
 
                 const innerNodes = templateInfo?.nodesArg ?? (extractedFromArgs as any).nodesNode;
@@ -519,8 +577,8 @@ export function parseDeclarativeGraphCallIntoContexts(
                         nodeCtx,
                         edgeCtx,
                         subgraphs,
-                        templates,
-                        nodeCtx.literalValues,
+                        childTemplates,
+                        childLiteralValues,
                         visited
                     );
                 }
@@ -540,12 +598,8 @@ export function parseDeclarativeGraphCallIntoContexts(
     if (edgesArg) {
         const edgeSpecs = parseEdgesListLiteral(edgesArg, code, nodeCtx.literalValues);
         for (const spec of edgeSpecs) {
-            const from = opts?.isRootGraph ? normalizeContainerEndpoint(spec.from, 'Graph') : spec.from;
-            const to = opts?.isRootGraph ? normalizeContainerEndpoint(spec.to, 'Graph') : spec.to;
-
-            // RootGraph uses global 'entry'/'exit' display nodes; Graph/Loop templates will be handled in expansion.
-            const resolvedFrom = opts?.isRootGraph && from === 'entry' ? 'entry' : from;
-            const resolvedTo = opts?.isRootGraph && to === 'exit' ? 'exit' : to;
+            const resolvedFrom = opts?.isRootGraph ? normalizeContainerEndpoint(spec.from, rootKind) : spec.from;
+            const resolvedTo = opts?.isRootGraph ? normalizeContainerEndpoint(spec.to, rootKind) : spec.to;
 
             const { keys, keysDetails } = parseEdgeKeysArgument(spec.keysNode, code);
 

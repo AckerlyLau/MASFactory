@@ -4,6 +4,7 @@ import { useUiStore } from './stores/ui';
 import PreviewTab from './components/PreviewTab.vue';
 import DebugTab from './components/DebugTab.vue';
 import RunTab from './components/RunTab.vue';
+import DragTab from './components/DragTab.vue';
 import VibeTab from './components/VibeTab.vue';
 import SessionDetail from './components/SessionDetail.vue';
 import HumanChatPopup from './components/HumanChatPopup.vue';
@@ -324,6 +325,15 @@ onMounted(() => {
         </button>
         <button
           class="tab"
+          :class="{ active: activeTab === 'drag' }"
+          role="tab"
+          :aria-selected="activeTab === 'drag'"
+          @click="ui.setActiveTab('drag')"
+        >
+          Drag
+        </button>
+        <button
+          class="tab"
           :class="{ active: activeTab === 'vibe' }"
           role="tab"
           :aria-selected="activeTab === 'vibe'"
@@ -356,6 +366,10 @@ onMounted(() => {
 
       <div class="pane" v-show="activeTab === 'run'">
         <RunTab />
+      </div>
+
+      <div class="pane" v-show="activeTab === 'drag'">
+        <DragTab />
       </div>
 
       <div class="pane" v-show="activeTab === 'vibe'">

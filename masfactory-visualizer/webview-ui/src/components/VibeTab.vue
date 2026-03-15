@@ -15,6 +15,9 @@ import {
 
 const vibe = useVibeStore();
 const ui = useUiStore();
+const props = withDefaults(defineProps<{ title?: string }>(), {
+  title: 'Vibing'
+});
 
 type Selection =
   | { kind: 'none' }
@@ -634,7 +637,7 @@ const issues = computed(() => validation.value?.issues || []);
     </div>
 
     <div class="header">
-      <div class="title">Vibing</div>
+      <div class="title">{{ props.title }}</div>
       <div class="meta">
         <span v-if="doc" class="mono">{{ doc.fileName }}</span>
         <span v-if="doc && doc.dirty" class="badge warn">Modified</span>

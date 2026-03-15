@@ -9,7 +9,7 @@ import * as path from 'path';
 import type { Node as TSNode, Parser as TreeSitterParser } from 'web-tree-sitter';
 
 import { GraphData, GraphEdge, ControlFlowInfo, GraphType } from './types';
-import { BASE_TYPES, getNodeText } from './astUtils';
+import { BASE_TYPES, collectClassBases, getNodeText, parseDictArgument, parseKeysArgument } from './astUtils';
 import { NodeParseContext } from './nodeParser';
 import { EdgeParseContext, isEdgeCreationMethod } from './edgeParser';
 import { mergeParserFeatures, type ParserFeatures } from './features';
@@ -17,8 +17,8 @@ import { findBuildMethodAndBaseType, parseBuildMethod, ControlFlowContext } from
 import { findRootGraphVariable, findFunctionWithRootGraph } from './rootGraphFinder';
 import { parseModuleLevel, parseFunctionBody } from './moduleLevelParser';
 import { parseImports, modulePathToFilePaths, isCompositeComponent, isBaseFrameworkType, ImportInfo } from './importResolver';
-import { parseComponentStructure, parseTemplateStructure, ComponentStructure } from './componentParser';
-import { tryParseNodeTemplateAssignment } from './templateParser';
+import { parseComponentStructure, parseTemplateStructure, buildTemplateStructure, ComponentStructure } from './componentParser';
+import { ParsedNodeTemplate, tryParseNodeTemplateAssignment } from './templateParser';
 import { 
     detectBuilderFunction, 
     parseBuilderFunction, 
@@ -33,6 +33,69 @@ interface BuilderCacheEntry {
     structure: BuilderFunctionStructure | null;
     sourceFilePath?: string;
     mtimeMs?: number;
+}
+
+interface ParsedPythonFile {
+    filePath: string;
+    code: string;
+    rootNode: TSNode;
+    imports: Map<string, ImportInfo>;
+    mtimeMs?: number;
+}
+
+interface TemplateResolverEnv {
+    preferredName?: string;
+    code: string;
+    rootNode: TSNode;
+    imports: Map<string, ImportInfo>;
+    sourceFilePath?: string;
+    templateBindings: { [name: string]: ParsedNodeTemplate };
+    exprBindings: { [name: string]: TSNode };
+    depth: number;
+    visited: Set<string>;
+}
+
+interface StandaloneTemplateScopeEnv {
+    code: string;
+    rootNode: TSNode;
+    imports: Map<string, ImportInfo>;
+    sourceFilePath?: string;
+    templateBindings: { [name: string]: ParsedNodeTemplate };
+    exprBindings: { [name: string]: TSNode };
+}
+
+interface StandaloneRenderableCandidate {
+    id: string;
+    kind: 'template' | 'assignment';
+    graphKind?: 'Graph' | 'Loop' | 'RootGraph';
+    template?: ParsedNodeTemplate;
+    lineNumber?: number;
+    sourceRootNode?: TSNode;
+    parseScopeNode?: TSNode;
+    scopeKind?: 'module' | 'function';
+    sourceCode?: string;
+    sourceFilePath?: string;
+    sourceImports?: Map<string, ImportInfo>;
+    sourceGraphVariable?: string;
+}
+
+interface GraphScopeMatch {
+    bodyNode: TSNode;
+    graphKind: 'Graph' | 'Loop' | 'RootGraph';
+    rootGraphVariable: string;
+    lineNumber: number;
+    methodName?: string;
+}
+
+interface ResolvedCallableDefinition {
+    callableDef: TSNode;
+    callableKind: 'function' | 'method';
+    callableName: string;
+    code: string;
+    rootNode: TSNode;
+    imports: Map<string, ImportInfo>;
+    filePath?: string;
+    ownerName?: string;
 }
 
 export interface ResolutionContext {
@@ -59,6 +122,7 @@ export class GraphParser {
      */
     private componentCache: Map<string, ComponentStructure | null> = new Map();
     private builderCache: Map<string, BuilderCacheEntry> = new Map();
+    private parsedFileCache: Map<string, ParsedPythonFile> = new Map();
     private imports: Map<string, ImportInfo> = new Map();
     private lastSourceFilePath: string | undefined;
     // Track builder function calls found during parsing (loopName -> builderInfo)
@@ -179,6 +243,10 @@ export class GraphParser {
 
                     const code = await this.fileReader(filePath);
                     if (!code) continue;
+                    const parser = this.getParser();
+                    const tree = parser ? parser.parse(code) : null;
+                    const rootNode = tree?.rootNode || null;
+                    const fileImports = rootNode ? parseImports(rootNode, code) : new Map<string, ImportInfo>();
 
                     console.log(`[Parser] Found component candidate for ${nodeType} at ${filePath}`);
                     const structure = parseComponentStructure(code, currentClassName);
@@ -192,9 +260,6 @@ export class GraphParser {
                         const looksEmpty = structure.nodes.length <= 2 && structure.edges.length === 0;
                         if ((structure.parsedMethodName === '__init__' || looksEmpty) && structure.baseClasses && structure.baseClasses.length > 0) {
                             try {
-                                const parser = this.getParser();
-                                const tree = parser ? parser.parse(code) : null;
-                                const fileImports = tree ? parseImports(tree.rootNode, code) : new Map<string, ImportInfo>();
                                 const localVisited = new Set<string>();
 
                                 const resolveBaseInSameFile = (baseClassText: string): ComponentStructure | null => {
@@ -263,6 +328,20 @@ export class GraphParser {
                             }
                         }
 
+                        if (looksEmpty && rootNode) {
+                            const wrappedStructure = this.tryParseWrappedRenderableStructure(
+                                rootNode,
+                                code,
+                                currentClassName,
+                                fileImports,
+                                filePath
+                            );
+                            if (wrappedStructure && wrappedStructure.nodes.length > 0) {
+                                this.componentCache.set(cacheKey, wrappedStructure);
+                                return wrappedStructure;
+                            }
+                        }
+
                         return structure;
                     }
 
@@ -273,6 +352,20 @@ export class GraphParser {
                         templateStructure.sourceFilePath = filePath;
                         this.componentCache.set(cacheKey, templateStructure);
                         return templateStructure;
+                    }
+
+                    if (rootNode) {
+                        const wrappedStructure = this.tryParseWrappedRenderableStructure(
+                            rootNode,
+                            code,
+                            currentClassName,
+                            fileImports,
+                            filePath
+                        );
+                        if (wrappedStructure) {
+                            this.componentCache.set(cacheKey, wrappedStructure);
+                            return wrappedStructure;
+                        }
                     }
 
                     const reexport = this.findReexportTarget(filePath, code, currentClassName);
@@ -508,6 +601,1539 @@ export class GraphParser {
         return null;
     }
 
+    private getCallArgs(callNode: TSNode): TSNode[] {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return [];
+        return argsNode.namedChildren.filter((n): n is TSNode => !!n && n.type !== 'comment');
+    }
+
+    private getPositionalArgs(args: TSNode[]): TSNode[] {
+        return args.filter((arg) => arg.type !== 'keyword_argument' && arg.type !== 'comment');
+    }
+
+    private getKeywordArgMap(args: TSNode[], code: string): Map<string, TSNode> {
+        const map = new Map<string, TSNode>();
+        for (const arg of args) {
+            if (arg.type !== 'keyword_argument') continue;
+            const nameNode = arg.childForFieldName('name');
+            const valueNode = arg.childForFieldName('value');
+            if (!nameNode || !valueNode) continue;
+            map.set(getNodeText(nameNode, code).trim(), valueNode);
+        }
+        return map;
+    }
+
+    private normalizeLookupKeys(raw: string): string[] {
+        const out: string[] = [];
+        const push = (value: string) => {
+            const next = String(value || '').trim();
+            if (!next || out.includes(next)) return;
+            out.push(next);
+        };
+        const trimmed = String(raw || '').trim();
+        push(trimmed);
+        if (trimmed.startsWith('self._')) push(trimmed.replace('self._', ''));
+        if (trimmed.startsWith('self.')) push(trimmed.replace('self.', ''));
+        const last = trimmed.split('.').pop() || '';
+        push(last);
+        if (last.startsWith('_')) push(last.slice(1));
+        return out;
+    }
+
+    private getParsedPythonFile(filePath: string): ParsedPythonFile | null {
+        try {
+            const stats = fs.statSync(filePath);
+            const cached = this.parsedFileCache.get(filePath);
+            if (cached && cached.mtimeMs !== undefined && cached.mtimeMs === stats.mtimeMs) {
+                return cached;
+            }
+
+            const parser = this.getParser();
+            if (!parser) return null;
+            const code = fs.readFileSync(filePath, 'utf-8');
+            const tree = parser.parse(code);
+            if (!tree) return null;
+
+            const parsed: ParsedPythonFile = {
+                filePath,
+                code,
+                rootNode: tree.rootNode,
+                imports: parseImports(tree.rootNode, code),
+                mtimeMs: stats.mtimeMs
+            };
+            this.parsedFileCache.set(filePath, parsed);
+            return parsed;
+        } catch {
+            return null;
+        }
+    }
+
+    private findTopLevelFunctionInRoot(rootNode: TSNode, code: string, functionName: string): TSNode | null {
+        const target = String(functionName || '').trim();
+        if (!target) return null;
+        for (const child of rootNode.children) {
+            if (!child) continue;
+            const fn =
+                child.type === 'decorated_definition'
+                    ? child.namedChildren.find((n): n is TSNode => !!n && n.type === 'function_definition') || null
+                    : child.type === 'function_definition'
+                        ? child
+                        : null;
+            if (!fn) continue;
+            const nameNode = fn.childForFieldName('name');
+            if (nameNode && getNodeText(nameNode, code).trim() === target) return fn;
+        }
+        return null;
+    }
+
+    private findTopLevelAssignmentRight(rootNode: TSNode, code: string, names: string[]): TSNode | null {
+        const wanted = new Set(names.map((n) => String(n || '').trim()).filter(Boolean));
+        if (wanted.size === 0) return null;
+        for (const child of rootNode.children) {
+            if (!child || child.type !== 'expression_statement') continue;
+            const first = child.namedChildren[0];
+            if (!first || (first.type !== 'assignment' && first.type !== 'typed_assignment')) continue;
+            const left = first.childForFieldName('left');
+            const right = first.childForFieldName('right');
+            if (!left || !right) continue;
+            if (wanted.has(getNodeText(left, code).trim())) return right;
+        }
+        return null;
+    }
+
+    private unwrapNamedDefinition(
+        node: TSNode | null | undefined,
+        type: 'function_definition' | 'class_definition'
+    ): TSNode | null {
+        if (!node) return null;
+        if (node.type === type) return node;
+        if (node.type !== 'decorated_definition') return null;
+        return node.namedChildren.find((child): child is TSNode => !!child && child.type === type) || null;
+    }
+
+    private getDefinitionName(node: TSNode | null | undefined, code: string): string {
+        const nameNode = node?.childForFieldName('name');
+        return nameNode ? getNodeText(nameNode, code).trim() : '';
+    }
+
+    private findTopLevelClassInRoot(rootNode: TSNode, code: string, className: string): TSNode | null {
+        const target = String(className || '').trim();
+        if (!target) return null;
+        for (const child of rootNode.children) {
+            const classDef = this.unwrapNamedDefinition(child, 'class_definition');
+            if (!classDef) continue;
+            if (this.getDefinitionName(classDef, code) === target) return classDef;
+        }
+        return null;
+    }
+
+    private findMethodInClassNode(classNode: TSNode, code: string, methodName: string): TSNode | null {
+        const target = String(methodName || '').trim();
+        if (!target) return null;
+        const body = classNode.childForFieldName('body');
+        if (!body) return null;
+        for (const child of body.namedChildren) {
+            const methodDef = this.unwrapNamedDefinition(child, 'function_definition');
+            if (!methodDef) continue;
+            if (this.getDefinitionName(methodDef, code) === target) return methodDef;
+        }
+        return null;
+    }
+
+    private getGraphKindFromFunctionText(functionText: string): 'Graph' | 'Loop' | 'RootGraph' | null {
+        const normalized = String(functionText || '').trim();
+        if (!normalized) return null;
+        const last = normalized.includes('.') ? normalized.split('.').pop()! : normalized;
+        if (last === 'RootGraph') return 'RootGraph';
+        if (last === 'Loop') return 'Loop';
+        if (last === 'Graph') return 'Graph';
+        return null;
+    }
+
+    private getGraphKindRank(kind: 'Graph' | 'Loop' | 'RootGraph'): number {
+        if (kind === 'RootGraph') return 3;
+        if (kind === 'Loop') return 2;
+        return 1;
+    }
+
+    private findGraphAssignmentInScope(scopeNode: TSNode, code: string): GraphScopeMatch | null {
+        const inspect = (node: TSNode): (GraphScopeMatch & { rank: number }) | null => {
+            let best: (GraphScopeMatch & { rank: number }) | null = null;
+
+            for (const child of node.children) {
+                if (!child) continue;
+
+                if (
+                    this.unwrapNamedDefinition(child, 'function_definition') ||
+                    this.unwrapNamedDefinition(child, 'class_definition')
+                ) {
+                    continue;
+                }
+
+                if (child.type === 'expression_statement') {
+                    const first = child.namedChildren[0];
+                    if (first && (first.type === 'assignment' || first.type === 'typed_assignment')) {
+                        const left = first.childForFieldName('left');
+                        const right = first.childForFieldName('right');
+                        if (!left || !right || right.type !== 'call') continue;
+
+                        const functionNode = right.childForFieldName('function');
+                        const graphKind = functionNode
+                            ? this.getGraphKindFromFunctionText(getNodeText(functionNode, code).trim())
+                            : null;
+                        if (!graphKind) continue;
+
+                        const rootGraphVariable = getNodeText(left, code).trim();
+                        if (!rootGraphVariable) continue;
+
+                        const candidate: GraphScopeMatch & { rank: number } = {
+                            bodyNode: node,
+                            graphKind,
+                            rootGraphVariable,
+                            lineNumber: right.startPosition.row + 1,
+                            rank: this.getGraphKindRank(graphKind)
+                        };
+                        if (!best || candidate.rank > best.rank) {
+                            best = candidate;
+                        }
+                        if (candidate.rank >= 3) {
+                            return candidate;
+                        }
+                    }
+                }
+
+                if (
+                    child.type === 'if_statement' ||
+                    child.type === 'for_statement' ||
+                    child.type === 'while_statement' ||
+                    child.type === 'with_statement'
+                ) {
+                    const body =
+                        child.childForFieldName('body') || child.childForFieldName('consequence');
+                    const alt = child.childForFieldName('alternative');
+                    const fromBody = body ? inspect(body) : null;
+                    if (fromBody && (!best || fromBody.rank > best.rank)) best = fromBody;
+                    if (best?.rank === 3) return best;
+                    const fromAlt = alt ? inspect(alt) : null;
+                    if (fromAlt && (!best || fromAlt.rank > best.rank)) best = fromAlt;
+                    if (best?.rank === 3) return best;
+                    continue;
+                }
+
+                if (child.type === 'try_statement') {
+                    const fromTry = child.childForFieldName('body')
+                        ? inspect(child.childForFieldName('body')!)
+                        : null;
+                    if (fromTry && (!best || fromTry.rank > best.rank)) best = fromTry;
+                    if (best?.rank === 3) return best;
+                    for (const clause of child.namedChildren) {
+                        if (!clause) continue;
+                        if (
+                            clause.type !== 'except_clause' &&
+                            clause.type !== 'else_clause' &&
+                            clause.type !== 'finally_clause'
+                        ) {
+                            continue;
+                        }
+                        const clauseBody =
+                            clause.childForFieldName('body') ||
+                            clause.namedChildren.find((n): n is TSNode => !!n && n.type === 'block') ||
+                            null;
+                        const fromClause = clauseBody ? inspect(clauseBody) : null;
+                        if (fromClause && (!best || fromClause.rank > best.rank)) best = fromClause;
+                        if (best?.rank === 3) return best;
+                    }
+                    continue;
+                }
+
+                if (child.type === 'block') {
+                    const fromBlock = inspect(child);
+                    if (fromBlock && (!best || fromBlock.rank > best.rank)) best = fromBlock;
+                    if (best?.rank === 3) return best;
+                }
+            }
+
+            return best;
+        };
+
+        const best = inspect(scopeNode);
+        if (!best) return null;
+        return {
+            bodyNode: best.bodyNode,
+            graphKind: best.graphKind,
+            rootGraphVariable: best.rootGraphVariable,
+            lineNumber: best.lineNumber
+        };
+    }
+
+    private getGraphMethodPreference(methodName: string): number {
+        const normalized = String(methodName || '').trim().toLowerCase();
+        if (!normalized) return 0;
+        if (normalized === 'build') return 100;
+        if (normalized === '__init__') return 90;
+        if (normalized === 'build_graph') return 80;
+        if (normalized === 'create_graph') return 75;
+        if (normalized === 'graph') return 70;
+        if (normalized.includes('graph')) return 60;
+        if (normalized.startsWith('build')) return 50;
+        if (normalized.startsWith('create')) return 40;
+        return 0;
+    }
+
+    private findFunctionGraphScope(rootNode: TSNode, code: string, functionName: string): GraphScopeMatch | null {
+        const functionDef = this.findTopLevelFunctionInRoot(rootNode, code, functionName);
+        if (!functionDef) return null;
+        const bodyNode = functionDef.childForFieldName('body');
+        if (!bodyNode) return null;
+        return this.findGraphAssignmentInScope(bodyNode, code);
+    }
+
+    private findClassGraphScope(
+        rootNode: TSNode,
+        code: string,
+        className: string,
+        preferredMethodName?: string
+    ): GraphScopeMatch | null {
+        const classDef = this.findTopLevelClassInRoot(rootNode, code, className);
+        if (!classDef) return null;
+        const classBody = classDef.childForFieldName('body');
+        if (!classBody) return null;
+
+        let best: (GraphScopeMatch & { methodPreference: number; rank: number }) | null = null;
+
+        for (const child of classBody.namedChildren) {
+            const methodDef = this.unwrapNamedDefinition(child, 'function_definition');
+            if (!methodDef) continue;
+            const methodName = this.getDefinitionName(methodDef, code);
+            if (preferredMethodName && methodName !== preferredMethodName) continue;
+            const bodyNode = methodDef.childForFieldName('body');
+            if (!bodyNode) continue;
+            const match = this.findGraphAssignmentInScope(bodyNode, code);
+            if (!match) continue;
+
+            const candidate: GraphScopeMatch & { methodPreference: number; rank: number } = {
+                ...match,
+                bodyNode,
+                methodName,
+                rank: this.getGraphKindRank(match.graphKind),
+                methodPreference: preferredMethodName ? 1000 : this.getGraphMethodPreference(methodName)
+            };
+
+            if (
+                !best ||
+                candidate.rank > best.rank ||
+                (candidate.rank === best.rank && candidate.methodPreference > best.methodPreference) ||
+                (
+                    candidate.rank === best.rank &&
+                    candidate.methodPreference === best.methodPreference &&
+                    candidate.lineNumber < best.lineNumber
+                )
+            ) {
+                best = candidate;
+            }
+        }
+
+        if (!best) return null;
+        return {
+            bodyNode: best.bodyNode,
+            graphKind: best.graphKind,
+            rootGraphVariable: best.rootGraphVariable,
+            lineNumber: best.lineNumber,
+            methodName: best.methodName
+        };
+    }
+
+    private createRenderableCandidateFromGraphScope(
+        id: string,
+        match: GraphScopeMatch,
+        sourceRootNode: TSNode,
+        code: string,
+        imports: Map<string, ImportInfo>,
+        sourceFilePath?: string
+    ): StandaloneRenderableCandidate {
+        return {
+            id,
+            kind: 'assignment',
+            graphKind: match.graphKind,
+            lineNumber: match.lineNumber,
+            sourceRootNode,
+            parseScopeNode: match.bodyNode,
+            scopeKind: 'function',
+            sourceCode: code,
+            sourceFilePath,
+            sourceImports: imports,
+            sourceGraphVariable: match.rootGraphVariable
+        };
+    }
+
+    private buildComponentStructureFromGraphData(
+        graphData: GraphData,
+        sourceFilePath?: string,
+        hasComplexStructure: boolean = false
+    ): ComponentStructure {
+        return {
+            nodes: [...(graphData.nodes || [])],
+            nodeTypes: { ...(graphData.nodeTypes || {}) },
+            nodeLineNumbers: { ...(graphData.nodeLineNumbers || {}) },
+            nodePullKeys: { ...(graphData.nodePullKeys || {}) },
+            nodePushKeys: { ...(graphData.nodePushKeys || {}) },
+            nodeAttributes: { ...(graphData.nodeAttributes || {}) },
+            edges: [...(graphData.edges || [])],
+            subgraphs: Object.fromEntries(
+                Object.entries(graphData.subgraphs || {}).map(([parent, children]) => [parent, [...children]])
+            ),
+            hasComplexStructure,
+            sourceFilePath
+        };
+    }
+
+    private getGraphDataForRenderableCandidate(candidate: StandaloneRenderableCandidate): GraphData | null {
+        if (candidate.kind === 'template' && candidate.template) {
+            if (candidate.template.baseKind === 'Node') {
+                return null;
+            }
+
+            const structure = buildTemplateStructure(
+                candidate.template,
+                candidate.template.sourceCode || candidate.sourceCode || ''
+            );
+            if (!structure) return null;
+            const subgraphParents: { [child: string]: string } = {};
+            const subgraphTypes: { [parent: string]: string } = {};
+            for (const [parent, children] of Object.entries(structure.subgraphs || {})) {
+                for (const child of children || []) {
+                    subgraphParents[child] = parent;
+                }
+                const isLoop =
+                    (children || []).some((child) => child.endsWith('_controller') || child.endsWith('_terminate')) ||
+                    (children || []).some((child) => structure.nodeTypes?.[child] === 'Controller');
+                subgraphTypes[parent] = isLoop ? 'Loop' : 'Graph';
+            }
+
+            return {
+                nodes: structure.nodes,
+                nodeTypes: structure.nodeTypes,
+                edges: structure.edges,
+                subgraphs: structure.subgraphs,
+                subgraphTypes,
+                subgraphParents,
+                nodeLineNumbers: structure.nodeLineNumbers,
+                nodePullKeys: structure.nodePullKeys,
+                nodePushKeys: structure.nodePushKeys,
+                nodeAttributes: structure.nodeAttributes,
+                graphType:
+                    structure.nodes.includes('controller') && structure.nodes.includes('terminate')
+                        ? 'Loop'
+                        : 'Graph',
+                controlFlow: { forLoops: [], ifConditions: [], dependencies: [] },
+                loopControls: {},
+                warnings: [],
+                pendingBuilderCalls: {}
+            };
+        }
+
+        if (candidate.kind === 'assignment' && candidate.graphKind) {
+            return this.parseStandaloneAssignmentGraph(
+                candidate.sourceRootNode!,
+                candidate.parseScopeNode || candidate.sourceRootNode!,
+                candidate.sourceCode || '',
+                candidate.sourceGraphVariable || candidate.id,
+                candidate.graphKind,
+                undefined,
+                candidate.sourceImports,
+                candidate.sourceFilePath,
+                candidate.scopeKind || 'module'
+            );
+        }
+
+        return null;
+    }
+
+    private tryParseWrappedRenderableStructure(
+        rootNode: TSNode,
+        code: string,
+        symbolName: string,
+        imports: Map<string, ImportInfo>,
+        sourceFilePath?: string
+    ): ComponentStructure | null {
+        const functionMatch = this.findFunctionGraphScope(rootNode, code, symbolName);
+        if (functionMatch) {
+            const graphData = this.parseStandaloneAssignmentGraph(
+                rootNode,
+                functionMatch.bodyNode,
+                code,
+                functionMatch.rootGraphVariable,
+                functionMatch.graphKind,
+                undefined,
+                imports,
+                sourceFilePath,
+                'function'
+            );
+            if (graphData) {
+                const hasComplexStructure =
+                    this.extractConditionVariables(functionMatch.bodyNode, code).length > 0 ||
+                    Object.keys(this.extractLoopControls(functionMatch.bodyNode, code)).length > 0;
+                return this.buildComponentStructureFromGraphData(
+                    graphData,
+                    sourceFilePath,
+                    hasComplexStructure
+                );
+            }
+        }
+
+        const classMatch = this.findClassGraphScope(rootNode, code, symbolName);
+        if (classMatch) {
+            const graphData = this.parseStandaloneAssignmentGraph(
+                rootNode,
+                classMatch.bodyNode,
+                code,
+                classMatch.rootGraphVariable,
+                classMatch.graphKind,
+                undefined,
+                imports,
+                sourceFilePath,
+                'function'
+            );
+            if (graphData) {
+                const hasComplexStructure =
+                    this.extractConditionVariables(classMatch.bodyNode, code).length > 0 ||
+                    Object.keys(this.extractLoopControls(classMatch.bodyNode, code)).length > 0;
+                return this.buildComponentStructureFromGraphData(
+                    graphData,
+                    sourceFilePath,
+                    hasComplexStructure
+                );
+            }
+        }
+
+        const assignmentRight = this.findTopLevelAssignmentRight(rootNode, code, this.normalizeLookupKeys(symbolName));
+        if (assignmentRight?.type === 'call') {
+            const resolved = this.resolveFunctionCallToRenderables(assignmentRight, {
+                preferredName: symbolName,
+                code,
+                rootNode,
+                imports,
+                sourceFilePath,
+                templateBindings: {},
+                exprBindings: {},
+                depth: 0,
+                visited: new Set<string>()
+            });
+            if (resolved?.length === 1) {
+                const aliased = this.cloneRenderableCandidateWithAlias(
+                    resolved[0],
+                    symbolName,
+                    assignmentRight.startPosition.row + 1
+                );
+                const graphData = this.getGraphDataForRenderableCandidate(aliased);
+                if (graphData) {
+                    return this.buildComponentStructureFromGraphData(graphData, sourceFilePath);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private mergeTemplateScope(parsed: ParsedNodeTemplate, env: TemplateResolverEnv): ParsedNodeTemplate {
+        const next: ParsedNodeTemplate = { ...parsed };
+        const scopedTemplates = {
+            ...(parsed.scopedTemplates || {}),
+            ...(env.templateBindings || {})
+        };
+        const literalValues = {
+            ...(parsed.literalValues || {}),
+            ...(env.exprBindings || {})
+        };
+        if (Object.keys(scopedTemplates).length > 0) next.scopedTemplates = scopedTemplates;
+        if (Object.keys(literalValues).length > 0) next.literalValues = literalValues;
+        if (!next.sourceFilePath && env.sourceFilePath) next.sourceFilePath = env.sourceFilePath;
+        if (!next.sourceCode && env.code) next.sourceCode = env.code;
+        return next;
+    }
+
+    private resolveImportedSymbolSource(
+        importInfo: ImportInfo,
+        sourceFilePath: string | undefined,
+        symbolName: string
+    ): { file: ParsedPythonFile; symbolName: string } | null {
+        const candidateRoots = this.getCandidateWorkspaceRoots(sourceFilePath, importInfo.modulePath);
+        const contextRoot =
+            (sourceFilePath
+                ? candidateRoots.find((root) => {
+                      try {
+                          void this.filePathToModulePath(sourceFilePath, root);
+                          return true;
+                      } catch {
+                          return false;
+                      }
+                  })
+                : undefined) || this.workspaceRoot;
+
+        let currentModulePath = this.resolveModulePathFromContext(
+            importInfo.modulePath,
+            sourceFilePath,
+            contextRoot
+        );
+        let currentSymbol = symbolName || importInfo.className;
+        const visited = new Set<string>();
+
+        for (let depth = 0; depth < 8; depth++) {
+            const visitKey = `${currentModulePath}::${currentSymbol}`;
+            if (visited.has(visitKey)) break;
+            visited.add(visitKey);
+
+            const potentialPaths = Array.from(
+                new Set(candidateRoots.flatMap((root) => modulePathToFilePaths(currentModulePath, root)))
+            );
+
+            let redirected = false;
+            for (const filePath of potentialPaths) {
+                const parsed = this.getParsedPythonFile(filePath);
+                if (!parsed) continue;
+
+                const hasFunction = !!this.findTopLevelFunctionInRoot(parsed.rootNode, parsed.code, currentSymbol);
+                const hasAssignment = !!this.findTopLevelAssignmentRight(
+                    parsed.rootNode,
+                    parsed.code,
+                    this.normalizeLookupKeys(currentSymbol)
+                );
+                if (hasFunction || hasAssignment) {
+                    return { file: parsed, symbolName: currentSymbol };
+                }
+
+                const reexport = currentSymbol
+                    ? this.findReexportTarget(filePath, parsed.code, currentSymbol)
+                    : null;
+                if (reexport) {
+                    currentModulePath = reexport.modulePath;
+                    currentSymbol = reexport.className;
+                    redirected = true;
+                    break;
+                }
+            }
+
+            if (!redirected) break;
+        }
+
+        return null;
+    }
+
+    private resolveCallableDefinition(
+        functionNode: TSNode,
+        env: TemplateResolverEnv
+    ): ResolvedCallableDefinition | null {
+        const functionText = getNodeText(functionNode, env.code).trim();
+        const normalizedName = functionText.includes('.') ? functionText.split('.').pop()! : functionText;
+
+        const resolveMethodSource = (
+            rootNode: TSNode,
+            code: string,
+            imports: Map<string, ImportInfo>,
+            sourceFilePath: string | undefined,
+            ownerText: string,
+            methodName: string
+        ): ResolvedCallableDefinition | null => {
+            for (const key of this.normalizeLookupKeys(ownerText)) {
+                const localClass = this.findTopLevelClassInRoot(rootNode, code, key);
+                if (localClass) {
+                    const methodDef = this.findMethodInClassNode(localClass, code, methodName);
+                    if (!methodDef) continue;
+                    return {
+                        callableDef: methodDef,
+                        callableKind: 'method',
+                        callableName: methodName,
+                        code,
+                        rootNode,
+                        imports,
+                        filePath: sourceFilePath,
+                        ownerName: this.getDefinitionName(localClass, code)
+                    };
+                }
+
+                const importInfo = this.resolveImportInfoForType(key, imports);
+                if (!importInfo) continue;
+                const source = this.resolveImportedSymbolSource(
+                    importInfo,
+                    sourceFilePath,
+                    importInfo.className || key
+                );
+                if (!source) continue;
+
+                const classNode = this.findTopLevelClassInRoot(
+                    source.file.rootNode,
+                    source.file.code,
+                    source.symbolName || key
+                );
+                if (!classNode) continue;
+                const methodDef = this.findMethodInClassNode(classNode, source.file.code, methodName);
+                if (!methodDef) continue;
+                return {
+                    callableDef: methodDef,
+                    callableKind: 'method',
+                    callableName: methodName,
+                    code: source.file.code,
+                    rootNode: source.file.rootNode,
+                    imports: source.file.imports,
+                    filePath: source.file.filePath,
+                    ownerName: this.getDefinitionName(classNode, source.file.code)
+                };
+            }
+
+            return null;
+        };
+
+        const currentFunction = this.findTopLevelFunctionInRoot(env.rootNode, env.code, normalizedName);
+        if (currentFunction) {
+            return {
+                callableDef: currentFunction,
+                callableKind: 'function',
+                callableName: normalizedName,
+                code: env.code,
+                rootNode: env.rootNode,
+                imports: env.imports,
+                filePath: env.sourceFilePath
+            };
+        }
+
+        if (functionNode.type === 'attribute') {
+            const objectNode =
+                functionNode.childForFieldName('object') ||
+                functionNode.namedChildren.find((child): child is TSNode => !!child) ||
+                null;
+            if (objectNode && (objectNode.type === 'identifier' || objectNode.type === 'attribute')) {
+                const ownerText = getNodeText(objectNode, env.code).trim();
+                const methodSource = resolveMethodSource(
+                    env.rootNode,
+                    env.code,
+                    env.imports,
+                    env.sourceFilePath,
+                    ownerText,
+                    normalizedName
+                );
+                if (methodSource) {
+                    return methodSource;
+                }
+            }
+        }
+
+        const importInfo =
+            this.resolveImportInfoForType(functionText, env.imports) ||
+            this.resolveImportInfoForType(normalizedName, env.imports);
+        if (!importInfo) return null;
+        const source = this.resolveImportedSymbolSource(
+            importInfo,
+            env.sourceFilePath,
+            importInfo.className || normalizedName
+        );
+        if (!source) return null;
+
+        const importedFunction = this.findTopLevelFunctionInRoot(
+            source.file.rootNode,
+            source.file.code,
+            source.symbolName || normalizedName
+        );
+        if (importedFunction) {
+            return {
+                callableDef: importedFunction,
+                callableKind: 'function',
+                callableName: source.symbolName || normalizedName,
+                code: source.file.code,
+                rootNode: source.file.rootNode,
+                imports: source.file.imports,
+                filePath: source.file.filePath
+            };
+        }
+
+        if (functionNode.type === 'attribute') {
+            const objectNode =
+                functionNode.childForFieldName('object') ||
+                functionNode.namedChildren.find((child): child is TSNode => !!child) ||
+                null;
+            if (objectNode && (objectNode.type === 'identifier' || objectNode.type === 'attribute')) {
+                const ownerText = getNodeText(objectNode, env.code).trim();
+                return resolveMethodSource(
+                    source.file.rootNode,
+                    source.file.code,
+                    source.file.imports,
+                    source.file.filePath,
+                    ownerText,
+                    normalizedName
+                );
+            }
+        }
+
+        return null;
+    }
+
+    private resolveTemplateExpression(expr: TSNode, env: TemplateResolverEnv): ParsedNodeTemplate | null {
+        if (!expr || env.depth > 10) return null;
+
+        const rawText = getNodeText(expr, env.code).trim();
+        const lookupKeys = this.normalizeLookupKeys(rawText);
+
+        if (expr.type === 'identifier' || expr.type === 'attribute') {
+            for (const key of lookupKeys) {
+                const template = env.templateBindings[key];
+                if (template) {
+                    return this.mergeTemplateScope(
+                        { ...template, templateName: env.preferredName || template.templateName || key },
+                        env
+                    );
+                }
+            }
+
+            for (const key of lookupKeys) {
+                const boundExpr = env.exprBindings[key];
+                if (boundExpr && boundExpr !== expr) {
+                    const resolved = this.resolveTemplateExpression(boundExpr, {
+                        ...env,
+                        preferredName: env.preferredName || key,
+                        depth: env.depth + 1
+                    });
+                    if (resolved) return resolved;
+                }
+            }
+
+            const assignment = this.findTopLevelAssignmentRight(env.rootNode, env.code, lookupKeys);
+            if (assignment && assignment !== expr) {
+                const resolved = this.resolveTemplateExpression(assignment, {
+                    ...env,
+                    preferredName: env.preferredName || lookupKeys[0],
+                    depth: env.depth + 1
+                });
+                if (resolved) return resolved;
+            }
+
+            for (const key of lookupKeys) {
+                const importInfo = this.resolveImportInfoForType(key, env.imports);
+                if (!importInfo) continue;
+                const source = this.resolveImportedSymbolSource(importInfo, env.sourceFilePath, importInfo.className || key);
+                if (!source) continue;
+                const assignmentNode = this.findTopLevelAssignmentRight(
+                    source.file.rootNode,
+                    source.file.code,
+                    this.normalizeLookupKeys(source.symbolName)
+                );
+                if (!assignmentNode) continue;
+                const resolved = this.resolveTemplateExpression(assignmentNode, {
+                    preferredName: env.preferredName || key,
+                    code: source.file.code,
+                    rootNode: source.file.rootNode,
+                    imports: source.file.imports,
+                    sourceFilePath: source.file.filePath,
+                    templateBindings: {},
+                    exprBindings: {},
+                    depth: env.depth + 1,
+                    visited: env.visited
+                });
+                if (resolved) return resolved;
+            }
+            return null;
+        }
+
+        if (expr.type !== 'call') return null;
+
+        const functionNode = expr.childForFieldName('function');
+        if (!functionNode) return null;
+        const functionText = getNodeText(functionNode, env.code).trim();
+        const args = this.getCallArgs(expr);
+        const positional = this.getPositionalArgs(args);
+        const kw = this.getKeywordArgMap(args, env.code);
+
+        const isNodeTemplateCall = functionText === 'NodeTemplate' || functionText.endsWith('.NodeTemplate');
+        if (isNodeTemplateCall) {
+            const parsed = tryParseNodeTemplateAssignment(env.preferredName || '__template__', expr, env.code);
+            return parsed ? this.mergeTemplateScope(parsed, env) : null;
+        }
+
+        const calleeLast = functionText.includes('.') ? functionText.split('.').pop()! : functionText;
+        if ((calleeLast === 'Shared' || calleeLast === 'Factory') && positional.length > 0) {
+            return this.resolveTemplateExpression(positional[0], {
+                ...env,
+                depth: env.depth + 1
+            });
+        }
+
+        if (calleeLast === 'clone' && functionNode.type === 'attribute') {
+            const baseExpr =
+                functionNode.childForFieldName('object') ||
+                functionNode.namedChildren.find((n): n is TSNode => !!n) ||
+                null;
+            if (baseExpr) {
+                const base = this.resolveTemplateExpression(baseExpr, {
+                    ...env,
+                    depth: env.depth + 1
+                });
+                if (base) {
+                    const next: ParsedNodeTemplate = {
+                        ...base,
+                        templateName: env.preferredName || base.templateName
+                    };
+                    if (kw.has('nodes')) next.nodesArg = kw.get('nodes');
+                    if (kw.has('edges')) next.edgesArg = kw.get('edges');
+                    if (kw.has('pull_keys')) next.pullKeys = parseKeysArgument(kw.get('pull_keys')!, env.code);
+                    if (kw.has('push_keys')) next.pushKeys = parseKeysArgument(kw.get('push_keys')!, env.code);
+                    if (kw.has('attributes')) next.attributes = parseDictArgument(kw.get('attributes')!, env.code);
+                    if (kw.has('build_func')) {
+                        const buildFuncExpr = kw.get('build_func');
+                        if (buildFuncExpr) {
+                            const fallback = tryParseNodeTemplateAssignment('__tmp__', expr, env.code);
+                            if (fallback?.buildFunc) next.buildFunc = fallback.buildFunc;
+                        }
+                    }
+                    return this.mergeTemplateScope(next, env);
+                }
+            }
+        }
+
+        return this.resolveFunctionCallToTemplate(expr, env);
+    }
+
+    private resolveFunctionCallToTemplate(callNode: TSNode, env: TemplateResolverEnv): ParsedNodeTemplate | null {
+        const functionNode = callNode.childForFieldName('function');
+        if (!functionNode) return null;
+        const functionText = getNodeText(functionNode, env.code).trim();
+        const normalizedName = functionText.includes('.') ? functionText.split('.').pop()! : functionText;
+        const visitKey = `${env.sourceFilePath || '<memory>'}::${functionText}::${getNodeText(callNode, env.code).trim()}`;
+        if (env.visited.has(visitKey)) return null;
+        const callable = this.resolveCallableDefinition(functionNode, env);
+        if (!callable) return null;
+
+        const fileCode = callable.code;
+        const fileRoot = callable.rootNode;
+        const fileImports = callable.imports;
+        const filePath = callable.filePath;
+        const functionDef = callable.callableDef;
+
+        env.visited.add(visitKey);
+        try {
+            const parametersNode = functionDef.childForFieldName('parameters');
+            const paramNames: string[] = [];
+            if (parametersNode) {
+                for (const child of parametersNode.namedChildren) {
+                    if (!child) continue;
+                    const nameNode =
+                        child.type === 'identifier'
+                            ? child
+                            : child.childForFieldName('name') || child.childForFieldName('pattern');
+                    if (!nameNode) continue;
+                    const name = getNodeText(nameNode, fileCode).trim();
+                    if (name && !paramNames.includes(name)) paramNames.push(name);
+                }
+            }
+            if (
+                callable.callableKind === 'method' &&
+                paramNames.length > 0 &&
+                (paramNames[0] === 'self' || paramNames[0] === 'cls')
+            ) {
+                paramNames.shift();
+            }
+
+            const args = this.getCallArgs(callNode);
+            const positional = this.getPositionalArgs(args);
+            const kw = this.getKeywordArgMap(args, env.code);
+
+            const localTemplates: { [name: string]: ParsedNodeTemplate } = {};
+            const localExprBindings: { [name: string]: TSNode } = {};
+
+            for (let i = 0; i < paramNames.length; i++) {
+                const paramName = paramNames[i];
+                const argNode = kw.get(paramName) || positional[i];
+                if (!argNode) continue;
+                localExprBindings[paramName] = argNode;
+                const resolved = this.resolveTemplateExpression(argNode, {
+                    preferredName: paramName,
+                    code: env.code,
+                    rootNode: env.rootNode,
+                    imports: env.imports,
+                    sourceFilePath: env.sourceFilePath,
+                    templateBindings: env.templateBindings,
+                    exprBindings: env.exprBindings,
+                    depth: env.depth + 1,
+                    visited: env.visited
+                });
+                if (resolved) localTemplates[paramName] = resolved;
+            }
+
+            const bodyNode = functionDef.childForFieldName('body');
+            if (!bodyNode) return null;
+
+            for (const stmt of bodyNode.children) {
+                if (!stmt) continue;
+
+                if (stmt.type === 'expression_statement') {
+                    const first = stmt.namedChildren[0];
+                    if (!first || (first.type !== 'assignment' && first.type !== 'typed_assignment')) continue;
+                    const left = first.childForFieldName('left');
+                    const right = first.childForFieldName('right');
+                    if (!left || !right) continue;
+                    const leftText = getNodeText(left, fileCode).trim();
+                    if (!leftText) continue;
+
+                    localExprBindings[leftText] = right;
+                    const resolved = this.resolveTemplateExpression(right, {
+                        preferredName: leftText,
+                        code: fileCode,
+                        rootNode: fileRoot,
+                        imports: fileImports,
+                        sourceFilePath: filePath,
+                        templateBindings: { ...localTemplates },
+                        exprBindings: { ...localExprBindings },
+                        depth: env.depth + 1,
+                        visited: env.visited
+                    });
+                    if (resolved) {
+                        localTemplates[leftText] = resolved;
+                    }
+                    continue;
+                }
+
+                if (stmt.type === 'return_statement') {
+                    const valueNode =
+                        stmt.childForFieldName('value') ||
+                        stmt.namedChildren.find((n): n is TSNode => !!n) ||
+                        null;
+                    if (!valueNode) continue;
+                    const resolved = this.resolveTemplateExpression(valueNode, {
+                        preferredName: env.preferredName || normalizedName,
+                        code: fileCode,
+                        rootNode: fileRoot,
+                        imports: fileImports,
+                        sourceFilePath: filePath,
+                        templateBindings: { ...localTemplates },
+                        exprBindings: { ...localExprBindings },
+                        depth: env.depth + 1,
+                        visited: env.visited
+                    });
+                    if (resolved) return resolved;
+                }
+            }
+        } finally {
+            env.visited.delete(visitKey);
+        }
+
+        return null;
+    }
+
+    private enrichStandaloneTemplateChildren(
+        parsed: ParsedNodeTemplate,
+        env: StandaloneTemplateScopeEnv
+    ): ParsedNodeTemplate {
+        if (!parsed.nodesArg) return parsed;
+
+        let scopeCode = parsed.sourceCode || env.code;
+        let scopeRoot = env.rootNode;
+        let scopeImports = env.imports;
+        let scopeSourceFilePath = parsed.sourceFilePath || env.sourceFilePath;
+
+        if (parsed.sourceFilePath && parsed.sourceFilePath !== env.sourceFilePath) {
+            const source = this.getParsedPythonFile(parsed.sourceFilePath);
+            if (source) {
+                scopeCode = source.code;
+                scopeRoot = source.rootNode;
+                scopeImports = source.imports;
+                scopeSourceFilePath = source.filePath;
+            }
+        }
+
+        const scopedTemplates: { [name: string]: ParsedNodeTemplate } = {
+            ...(parsed.scopedTemplates || {}),
+            ...(env.templateBindings || {})
+        };
+        const scopedExprBindings: { [name: string]: TSNode } = {
+            ...(parsed.literalValues || {}),
+            ...(env.exprBindings || {})
+        };
+
+        for (const item of parsed.nodesArg.namedChildren) {
+            if (!item || item.type !== 'tuple') continue;
+            const elems = item.namedChildren.filter((n): n is TSNode => !!n && n.type !== 'comment');
+            if (elems.length < 2) continue;
+            const typeNode = elems[1];
+            const rawType = getNodeText(typeNode, scopeCode).trim();
+            if (!rawType) continue;
+            if (scopedTemplates[rawType] || scopedTemplates[rawType.includes('.') ? rawType.split('.').pop()! : rawType]) {
+                continue;
+            }
+
+            const resolved = this.resolveTemplateExpression(typeNode, {
+                preferredName: rawType,
+                code: scopeCode,
+                rootNode: scopeRoot,
+                imports: scopeImports,
+                sourceFilePath: scopeSourceFilePath,
+                templateBindings: scopedTemplates,
+                exprBindings: scopedExprBindings,
+                depth: 0,
+                visited: new Set<string>()
+            });
+            if (!resolved) continue;
+
+            const register = (key: string, value: ParsedNodeTemplate) => {
+                const next = String(key || '').trim();
+                if (!next) return;
+                scopedTemplates[next] = value;
+            };
+            register(rawType, resolved);
+            register(resolved.templateName, resolved);
+            register(rawType.includes('.') ? rawType.split('.').pop()! : rawType, resolved);
+            register(
+                resolved.templateName.includes('.') ? resolved.templateName.split('.').pop()! : resolved.templateName,
+                resolved
+            );
+        }
+
+        return {
+            ...parsed,
+            scopedTemplates,
+            literalValues: scopedExprBindings
+        };
+    }
+
+    private parseStandaloneAssignmentGraph(
+        sourceRootNode: TSNode,
+        parseScopeNode: TSNode,
+        code: string,
+        rootGraphVariable: string,
+        graphKind: 'Graph' | 'Loop' | 'RootGraph',
+        controlFlowCtx?: ControlFlowContext,
+        sourceImports?: Map<string, ImportInfo>,
+        sourceFilePath?: string,
+        scopeKind: 'module' | 'function' = 'module'
+    ): GraphData | null {
+        const localClassBases = collectClassBases(sourceRootNode, code);
+        const baseType =
+            graphKind === 'Loop'
+                ? BASE_TYPES.LOOP
+                : graphKind === 'RootGraph'
+                    ? BASE_TYPES.ROOT_GRAPH
+                    : BASE_TYPES.GRAPH;
+        const result = this.initializeResult(baseType, rootGraphVariable);
+
+        const nodeCtx: NodeParseContext = {
+            nodes: result.nodes,
+            nodeTypes: result.nodeTypes,
+            nodeLineNumbers: result.nodeLineNumbers,
+            variableToNodeName: result.variableToNodeName,
+            nodePullKeys: result.nodePullKeys,
+            nodePushKeys: result.nodePushKeys,
+            nodeAttributes: result.nodeAttributes,
+            subgraphParents: result.subgraphParents,
+            nodeBuildFuncs: {},
+            templates: {},
+            literalValues: {},
+            localClassBases,
+            resolveTemplateAssignment: (leftText, callNode, callCode, templates, literalValues) =>
+                this.resolveTemplateExpression(callNode, {
+                    preferredName: leftText,
+                    code: callCode,
+                    rootNode: sourceRootNode,
+                    imports: new Map(sourceImports || this.imports),
+                    sourceFilePath: sourceFilePath || this.lastSourceFilePath,
+                    templateBindings: { ...(templates || {}) },
+                    exprBindings: { ...(literalValues || {}) },
+                    depth: 0,
+                    visited: new Set<string>()
+                }),
+            features: this.features
+        };
+
+        const edgeCtx: EdgeParseContext = {
+            edges: result.edges,
+            variableToNodeName: result.variableToNodeName,
+            nodes: result.nodes,
+            subgraphParents: result.subgraphParents,
+            literalValues: nodeCtx.literalValues,
+            features: this.features
+        };
+
+        if (scopeKind === 'function') {
+            parseFunctionBody(parseScopeNode, code, nodeCtx, edgeCtx, result.subgraphs, rootGraphVariable, controlFlowCtx);
+        } else {
+            parseModuleLevel(sourceRootNode, code, nodeCtx, edgeCtx, result.subgraphs, rootGraphVariable, controlFlowCtx);
+        }
+
+        const pendingSnapshot = new Map(this.pendingBuilderCalls);
+        this.pendingBuilderCalls.clear();
+        try {
+            this.detectBuilderFunctionCalls(code, nodeCtx.variableToNodeName);
+            this.addBuildFuncToPendingCalls(nodeCtx.nodeBuildFuncs || {});
+            return {
+                nodes: result.nodes,
+                nodeTypes: result.nodeTypes,
+                edges: result.edges,
+                subgraphs: result.subgraphs,
+                subgraphTypes: result.subgraphTypes,
+                subgraphParents: result.subgraphParents,
+                nodeLineNumbers: result.nodeLineNumbers,
+                nodePullKeys: result.nodePullKeys,
+                nodePushKeys: result.nodePushKeys,
+                nodeAttributes: result.nodeAttributes,
+                graphType: graphKind,
+                controlFlow: { forLoops: [], ifConditions: [], dependencies: [] },
+                loopControls: {},
+                warnings: [],
+                pendingBuilderCalls: Object.fromEntries(this.pendingBuilderCalls)
+            };
+        } finally {
+            this.pendingBuilderCalls.clear();
+            for (const [key, value] of pendingSnapshot.entries()) {
+                this.pendingBuilderCalls.set(key, value);
+            }
+        }
+    }
+
+    private extractPatternBindingNames(patternNode: TSNode, code: string): string[] {
+        const out: string[] = [];
+        const seen = new Set<string>();
+        const push = (raw: string): void => {
+            const next = String(raw || '').trim();
+            if (!next || next === '_' || seen.has(next)) return;
+            seen.add(next);
+            out.push(next);
+        };
+
+        const stack: TSNode[] = [patternNode];
+        while (stack.length > 0) {
+            const node = stack.pop()!;
+            if (node.type === 'identifier' || node.type === 'attribute') {
+                push(getNodeText(node, code));
+                continue;
+            }
+
+            if (
+                node.type === 'tuple' ||
+                node.type === 'list' ||
+                node.type === 'pattern_list' ||
+                node.type === 'tuple_pattern' ||
+                node.type === 'list_pattern'
+            ) {
+                for (let i = node.namedChildren.length - 1; i >= 0; i--) {
+                    const child = node.namedChildren[i];
+                    if (child) stack.push(child);
+                }
+            }
+        }
+
+        return out;
+    }
+
+    private cloneRenderableCandidateWithAlias(
+        candidate: StandaloneRenderableCandidate,
+        alias: string,
+        lineNumber?: number
+    ): StandaloneRenderableCandidate {
+        const nextId = String(alias || '').trim();
+        if (!nextId) return candidate;
+
+        if (candidate.kind === 'template' && candidate.template) {
+            return {
+                ...candidate,
+                id: nextId,
+                template: {
+                    ...candidate.template,
+                    templateName: nextId
+                },
+                lineNumber: lineNumber ?? candidate.lineNumber ?? candidate.template.lineNumber
+            };
+        }
+
+        return {
+            ...candidate,
+            id: nextId,
+            lineNumber: lineNumber ?? candidate.lineNumber,
+            sourceGraphVariable: candidate.sourceGraphVariable || candidate.id
+        };
+    }
+
+    private resolveFunctionCallToRenderables(
+        callNode: TSNode,
+        env: TemplateResolverEnv
+    ): StandaloneRenderableCandidate[] | null {
+        const functionNode = callNode.childForFieldName('function');
+        if (!functionNode) return null;
+
+        const functionText = getNodeText(functionNode, env.code).trim();
+        const normalizedName = functionText.includes('.') ? functionText.split('.').pop()! : functionText;
+        const visitKey = `${env.sourceFilePath || '<memory>'}::renderable::${functionText}::${getNodeText(callNode, env.code).trim()}`;
+        if (env.visited.has(visitKey)) return null;
+        const callable = this.resolveCallableDefinition(functionNode, env);
+        if (!callable) return null;
+
+        const fileCode = callable.code;
+        const fileRoot = callable.rootNode;
+        const fileImports = callable.imports;
+        const filePath = callable.filePath;
+        const functionDef = callable.callableDef;
+
+        env.visited.add(visitKey);
+        try {
+            const parametersNode = functionDef.childForFieldName('parameters');
+            const paramNames: string[] = [];
+            if (parametersNode) {
+                for (const child of parametersNode.namedChildren) {
+                    if (!child) continue;
+                    const nameNode =
+                        child.type === 'identifier'
+                            ? child
+                            : child.childForFieldName('name') || child.childForFieldName('pattern');
+                    if (!nameNode) continue;
+                    const name = getNodeText(nameNode, fileCode).trim();
+                    if (name && !paramNames.includes(name)) paramNames.push(name);
+                }
+            }
+            if (
+                callable.callableKind === 'method' &&
+                paramNames.length > 0 &&
+                (paramNames[0] === 'self' || paramNames[0] === 'cls')
+            ) {
+                paramNames.shift();
+            }
+
+            const args = this.getCallArgs(callNode);
+            const positional = this.getPositionalArgs(args);
+            const kw = this.getKeywordArgMap(args, env.code);
+
+            const localTemplates: { [name: string]: ParsedNodeTemplate } = {};
+            const localExprBindings: { [name: string]: TSNode } = {};
+            const localCandidates: { [name: string]: StandaloneRenderableCandidate } = {};
+            const registerLocalCandidate = (name: string, candidate: StandaloneRenderableCandidate): void => {
+                for (const key of this.normalizeLookupKeys(name)) {
+                    localCandidates[key] = candidate;
+                }
+            };
+            const lookupLocalCandidate = (raw: string): StandaloneRenderableCandidate | null => {
+                for (const key of this.normalizeLookupKeys(raw)) {
+                    const candidate = localCandidates[key];
+                    if (candidate) return candidate;
+                }
+                return null;
+            };
+            const bindExpr = (name: string, value: TSNode): void => {
+                for (const key of this.normalizeLookupKeys(name)) {
+                    localExprBindings[key] = value;
+                }
+            };
+            const lookupExpr = (raw: string): TSNode | null => {
+                for (const key of this.normalizeLookupKeys(raw)) {
+                    const bound = localExprBindings[key];
+                    if (bound) return bound;
+                }
+                return null;
+            };
+            const resolveNestedEnv = (preferredName?: string): TemplateResolverEnv => ({
+                preferredName,
+                code: fileCode,
+                rootNode: fileRoot,
+                imports: fileImports,
+                sourceFilePath: filePath,
+                templateBindings: { ...env.templateBindings, ...localTemplates },
+                exprBindings: { ...env.exprBindings, ...localExprBindings },
+                depth: env.depth + 1,
+                visited: env.visited
+            });
+            const resolveReturnValue = (valueNode: TSNode | null | undefined): StandaloneRenderableCandidate[] => {
+                if (!valueNode) return [];
+
+                if (
+                    valueNode.type === 'tuple' ||
+                    valueNode.type === 'list' ||
+                    valueNode.type === 'expression_list'
+                ) {
+                    const nested: StandaloneRenderableCandidate[] = [];
+                    for (const child of valueNode.namedChildren) {
+                        if (!child || child.type === 'comment') continue;
+                        nested.push(...resolveReturnValue(child));
+                    }
+                    return nested;
+                }
+
+                if (valueNode.type === 'identifier' || valueNode.type === 'attribute') {
+                    const raw = getNodeText(valueNode, fileCode).trim();
+                    const localCandidate = lookupLocalCandidate(raw);
+                    if (localCandidate) return [localCandidate];
+
+                    const bound = lookupExpr(raw);
+                    if (bound && bound !== valueNode) {
+                        const resolved = resolveReturnValue(bound);
+                        if (resolved.length > 0) return resolved;
+                    }
+
+                    const parsed = this.resolveTemplateExpression(valueNode, resolveNestedEnv(raw));
+                    if (parsed) {
+                        return [
+                            {
+                                id: parsed.templateName,
+                                kind: 'template',
+                                template: parsed,
+                                lineNumber: parsed.lineNumber
+                            }
+                        ];
+                    }
+                    return [];
+                }
+
+                if (valueNode.type === 'call') {
+                    const parsed = this.resolveTemplateExpression(valueNode, resolveNestedEnv(normalizedName));
+                    if (parsed) {
+                        return [
+                            {
+                                id: parsed.templateName,
+                                kind: 'template',
+                                template: parsed,
+                                lineNumber: parsed.lineNumber
+                            }
+                        ];
+                    }
+
+                    const nested = this.resolveFunctionCallToRenderables(valueNode, resolveNestedEnv(normalizedName));
+                    return nested || [];
+                }
+
+                return [];
+            };
+
+            for (let i = 0; i < paramNames.length; i++) {
+                const paramName = paramNames[i];
+                const argNode = kw.get(paramName) || positional[i];
+                if (!argNode) continue;
+                bindExpr(paramName, argNode);
+                const resolved = this.resolveTemplateExpression(argNode, {
+                    preferredName: paramName,
+                    code: env.code,
+                    rootNode: env.rootNode,
+                    imports: env.imports,
+                    sourceFilePath: env.sourceFilePath,
+                    templateBindings: env.templateBindings,
+                    exprBindings: env.exprBindings,
+                    depth: env.depth + 1,
+                    visited: env.visited
+                });
+                if (resolved) localTemplates[paramName] = resolved;
+            }
+
+            const bodyNode = functionDef.childForFieldName('body');
+            if (!bodyNode) return null;
+
+            for (const stmt of bodyNode.children) {
+                if (!stmt) continue;
+
+                if (stmt.type === 'expression_statement') {
+                    const first = stmt.namedChildren[0];
+                    if (!first || (first.type !== 'assignment' && first.type !== 'typed_assignment')) continue;
+                    const left = first.childForFieldName('left');
+                    const right = first.childForFieldName('right');
+                    if (!left || !right) continue;
+
+                    const bindingNames = this.extractPatternBindingNames(left, fileCode);
+                    if (bindingNames.length === 1) {
+                        bindExpr(bindingNames[0], right);
+                    }
+
+                    if (right.type === 'call' && bindingNames.length === 1) {
+                        const leftName = bindingNames[0];
+                        const fnNode = right.childForFieldName('function');
+                        const fnText = fnNode ? getNodeText(fnNode, fileCode).trim() : '';
+                        const normalizedFn = fnText.includes('.') ? fnText.split('.').pop()! : fnText;
+
+                        if (normalizedFn === 'Graph' || normalizedFn === 'Loop' || normalizedFn === 'RootGraph') {
+                            registerLocalCandidate(leftName, {
+                                id: leftName,
+                                kind: 'assignment',
+                                graphKind: normalizedFn,
+                                lineNumber: right.startPosition.row + 1,
+                                sourceRootNode: fileRoot,
+                                parseScopeNode: bodyNode,
+                                scopeKind: 'function',
+                                sourceCode: fileCode,
+                                sourceFilePath: filePath,
+                                sourceImports: fileImports,
+                                sourceGraphVariable: leftName
+                            });
+                            continue;
+                        }
+
+                        const parsed =
+                            tryParseNodeTemplateAssignment(leftName, right, fileCode) ||
+                            this.resolveTemplateExpression(right, resolveNestedEnv(leftName));
+                        if (parsed) {
+                            localTemplates[leftName] = parsed;
+                            registerLocalCandidate(leftName, {
+                                id: leftName,
+                                kind: 'template',
+                                template: {
+                                    ...parsed,
+                                    templateName: leftName
+                                },
+                                lineNumber: parsed.lineNumber
+                            });
+                            continue;
+                        }
+
+                        const nested = this.resolveFunctionCallToRenderables(right, resolveNestedEnv(leftName));
+                        if (nested?.length === 1) {
+                            registerLocalCandidate(
+                                leftName,
+                                this.cloneRenderableCandidateWithAlias(nested[0], leftName, right.startPosition.row + 1)
+                            );
+                            continue;
+                        }
+                    }
+
+                    if (
+                        bindingNames.length === 1 &&
+                        (right.type === 'identifier' || right.type === 'attribute')
+                    ) {
+                        const existing = lookupLocalCandidate(getNodeText(right, fileCode).trim());
+                        if (existing) {
+                            registerLocalCandidate(
+                                bindingNames[0],
+                                this.cloneRenderableCandidateWithAlias(
+                                    existing,
+                                    bindingNames[0],
+                                    right.startPosition.row + 1
+                                )
+                            );
+                            continue;
+                        }
+                    }
+
+                    if (bindingNames.length > 1 && right.type === 'call') {
+                        const nested = this.resolveFunctionCallToRenderables(right, resolveNestedEnv(bindingNames[0]));
+                        if (nested?.length) {
+                            const count = Math.min(bindingNames.length, nested.length);
+                            for (let i = 0; i < count; i++) {
+                                registerLocalCandidate(
+                                    bindingNames[i],
+                                    this.cloneRenderableCandidateWithAlias(
+                                        nested[i],
+                                        bindingNames[i],
+                                        right.startPosition.row + 1
+                                    )
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (stmt.type === 'return_statement') {
+                    const valueNode =
+                        stmt.childForFieldName('value') ||
+                        stmt.namedChildren.find((n): n is TSNode => !!n) ||
+                        null;
+                    const resolved = resolveReturnValue(valueNode);
+                    if (resolved.length > 0) return resolved;
+                }
+            }
+        } finally {
+            env.visited.delete(visitKey);
+        }
+
+        return null;
+    }
+
     /**
      * Parse Python code and extract graph structure
      * @param controlFlowCtx - Optional control flow context with user-specified loop iterations and condition values
@@ -540,6 +2166,7 @@ export class GraphParser {
             };
         }
         const rootNode = tree.rootNode;
+        const localClassBases = collectClassBases(rootNode, code);
 
         // Parse import statements for cross-file resolution
         this.imports = parseImports(rootNode, code);
@@ -574,6 +2201,19 @@ export class GraphParser {
             nodeBuildFuncs: {},  // Track build_func parameters
             templates: {},        // Track local NodeTemplate definitions
             literalValues: {},    // Track simple literal bindings for declarative graphs
+            localClassBases,
+            resolveTemplateAssignment: (leftText, callNode, callCode, templates, literalValues) =>
+                this.resolveTemplateExpression(callNode, {
+                    preferredName: leftText,
+                    code: callCode,
+                    rootNode,
+                    imports: new Map(this.imports),
+                    sourceFilePath,
+                    templateBindings: { ...(templates || {}) },
+                    exprBindings: { ...(literalValues || {}) },
+                    depth: 0,
+                    visited: new Set<string>()
+                }),
             features: this.features
         };
 
@@ -582,6 +2222,7 @@ export class GraphParser {
             variableToNodeName: result.variableToNodeName,
             nodes: result.nodes,
             subgraphParents: result.subgraphParents,
+            literalValues: nodeCtx.literalValues,
             features: this.features
         };
 
@@ -603,20 +2244,25 @@ export class GraphParser {
             this.detectBuilderFunctionCalls(code, nodeCtx.variableToNodeName);
             this.addBuildFuncToPendingCalls(nodeCtx.nodeBuildFuncs || {});
 
-            // Fallback for new declarative style: many files define ONLY a module-level NodeTemplate(Graph/Loop, nodes=[...], edges=[...])
-            // (e.g., ProfileGenerationGraph = NodeTemplate(Graph, ...)).
-            // In this case there is no RootGraph() instantiation nor a class build(), so we preview the template itself.
+            const standalone = this.tryParseStandaloneTemplateGraph(
+                rootNode,
+                code,
+                opts?.templateName ?? null,
+                controlFlowCtx
+            );
+            const rootGraphVar = findRootGraphVariable(rootNode, code);
+            const standaloneCandidates = standalone?.graphCandidates?.length || 0;
             if (
-                this.features.declarativeGraphs !== false &&
-                this.features.nodeTemplates !== false &&
-                result.edges.length === 0 &&
-                result.nodes.length <= 2
+                standalone &&
+                (
+                    standaloneCandidates > 1 ||
+                    !rootGraphVar ||
+                    !!opts?.templateName ||
+                    (standalone.selectedGraph && standalone.selectedGraph !== rootGraphVar)
+                )
             ) {
-                const fallback = this.tryParseStandaloneTemplateGraph(rootNode, code, opts?.templateName ?? null);
-                if (fallback) {
-                    this.logParseResult(fallback.nodes, fallback.edges);
-                    return fallback;
-                }
+                this.logParseResult(standalone.nodes, standalone.edges);
+                return standalone;
             }
         }
 
@@ -655,8 +2301,9 @@ export class GraphParser {
             }
         }
 
-        // Determine graph type from class name
-        const graphType = this.determineGraphType(className, baseType);
+        const graphType = buildMethod
+            ? this.determineGraphType(className, baseType)
+            : this.inferNonClassGraphType(rootNode, code);
 
         const warnings: string[] = [];
         if (conditionControlsForWarnings.length > 0 || (loopControls && Object.keys(loopControls).length > 0)) {
@@ -874,34 +2521,198 @@ export class GraphParser {
      * Determine the specific graph type from class name
      */
     private determineGraphType(className: string, baseType: string): GraphType {
-        const knownTypes: GraphType[] = [
-            'HorizontalGraph', 'VerticalGraph', 'AdjacencyMatrixGraph', 
-            'AdjacencyListGraph', 'HubGraph', 'MeshGraph', 'BrainstormingGraph',
-            'RootGraph', 'Graph', 'Loop'
-        ];
-        
-        for (const type of knownTypes) {
-            if (className.includes(type)) {
-                return type;
-            }
-        }
-        
-        if (baseType === BASE_TYPES.LOOP) return 'Loop';
         if (baseType === BASE_TYPES.ROOT_GRAPH) return 'RootGraph';
-        if (baseType === BASE_TYPES.GRAPH) return 'Graph';
-        
+
+        const loopTypes: GraphType[] = ['HubGraph', 'MeshGraph', 'Loop'];
+        const graphTypes: GraphType[] = [
+            'HorizontalGraph',
+            'VerticalGraph',
+            'AdjacencyMatrixGraph',
+            'AdjacencyListGraph',
+            'BrainstormingGraph',
+            'Graph'
+        ];
+
+        if (baseType === BASE_TYPES.LOOP) {
+            for (const type of loopTypes) {
+                if (className.includes(type)) {
+                    return type;
+                }
+            }
+            return 'Loop';
+        }
+
+        if (baseType === BASE_TYPES.GRAPH) {
+            for (const type of graphTypes) {
+                if (type !== 'Graph' && className.includes(type)) {
+                    return type;
+                }
+            }
+            return 'Graph';
+        }
+
         return 'unknown';
+    }
+
+    private inferNonClassGraphType(rootNode: TSNode, code: string): GraphType {
+        const inspect = (node: TSNode | null | undefined): GraphType | null => {
+            if (!node) return null;
+
+            for (const child of node.children) {
+                if (!child) continue;
+
+                const functionNode =
+                    child.type === 'decorated_definition'
+                        ? child.namedChildren.find((n): n is TSNode => !!n && n.type === 'function_definition') || null
+                        : child.type === 'function_definition'
+                            ? child
+                            : null;
+                if (functionNode) {
+                    const foundInFunction = inspect(functionNode.childForFieldName('body'));
+                    if (foundInFunction) return foundInFunction;
+                    continue;
+                }
+
+                if (child.type === 'expression_statement') {
+                    const first = child.namedChildren[0];
+                    if (first && (first.type === 'assignment' || first.type === 'typed_assignment')) {
+                        const right = first.childForFieldName('right');
+                        const call = right && right.type === 'call' ? right : null;
+                        const functionExpr = call?.childForFieldName('function');
+                        const functionText = functionExpr ? getNodeText(functionExpr, code).trim() : '';
+                        const normalized = functionText.includes('.') ? functionText.split('.').pop()! : functionText;
+                        if (normalized === 'RootGraph') return 'RootGraph';
+                        if (normalized === 'Loop') return 'Loop';
+                        if (normalized === 'Graph') return 'Graph';
+                    }
+                }
+
+                if (
+                    child.type === 'if_statement' ||
+                    child.type === 'for_statement' ||
+                    child.type === 'while_statement' ||
+                    child.type === 'with_statement'
+                ) {
+                    const foundInBody = inspect(child.childForFieldName('body') || child.childForFieldName('consequence'));
+                    if (foundInBody) return foundInBody;
+                    const foundInAlt = inspect(child.childForFieldName('alternative'));
+                    if (foundInAlt) return foundInAlt;
+                }
+
+                if (child.type === 'try_statement') {
+                    const foundInTry = inspect(child.childForFieldName('body'));
+                    if (foundInTry) return foundInTry;
+                    for (const clause of child.namedChildren) {
+                        if (!clause) continue;
+                        if (clause.type !== 'except_clause' && clause.type !== 'else_clause' && clause.type !== 'finally_clause') {
+                            continue;
+                        }
+                        const foundInClause = inspect(
+                            clause.childForFieldName('body') ||
+                                clause.namedChildren.find((n): n is TSNode => !!n && n.type === 'block') ||
+                                null
+                        );
+                        if (foundInClause) return foundInClause;
+                    }
+                }
+
+                if (child.type === 'block') {
+                    const foundInBlock = inspect(child);
+                    if (foundInBlock) return foundInBlock;
+                }
+            }
+
+            return null;
+        };
+
+        return inspect(rootNode) || 'unknown';
     }
 
     private tryParseStandaloneTemplateGraph(
         rootNode: TSNode,
         code: string,
-        preferredTemplate: string | null
+        preferredTemplate: string | null,
+        controlFlowCtx?: ControlFlowContext
     ): GraphData | null {
         const candidates: string[] = [];
         const exportedNames: Set<string> = new Set();
+        const literalValues: { [name: string]: TSNode } = {};
+        const templates: { [name: string]: ParsedNodeTemplate } = {};
+        const candidateEntries: { [name: string]: StandaloneRenderableCandidate } = {};
 
         const stripStringQuotes = (raw: string): string => raw.replace(/^f?["']|["']$/g, '');
+        const lastSegment = (name: string): string => (name.includes('.') ? name.split('.').pop()! : name);
+        const normalizeTypeName = (raw: string): string => {
+            const text = String(raw || '').trim();
+            if (!text) return 'Node';
+            return text.includes('.') ? text.split('.').pop()! : text;
+        };
+        const registerCandidate = (candidate: StandaloneRenderableCandidate): void => {
+            const id = String(candidate.id || '').trim();
+            if (!id) return;
+            candidateEntries[id] = candidate;
+            if (!candidates.includes(id)) {
+                candidates.push(id);
+            }
+        };
+        const hasEquivalentAssignmentCandidate = (match: GraphScopeMatch): boolean => {
+            const sameScope = (node: TSNode | undefined, target: TSNode): boolean => {
+                if (!node) return false;
+                return (
+                    node.type === target.type &&
+                    node.startPosition.row === target.startPosition.row &&
+                    node.startPosition.column === target.startPosition.column &&
+                    node.endPosition.row === target.endPosition.row &&
+                    node.endPosition.column === target.endPosition.column
+                );
+            };
+            return Object.values(candidateEntries).some((candidate) => {
+                return (
+                    candidate.kind === 'assignment' &&
+                    sameScope(candidate.parseScopeNode, match.bodyNode) &&
+                    candidate.sourceGraphVariable === match.rootGraphVariable &&
+                    candidate.graphKind === match.graphKind
+                );
+            });
+        };
+        const registerTemplate = (parsed: ParsedNodeTemplate): void => {
+            const store = (key: string, value: ParsedNodeTemplate) => {
+                const next = String(key || '').trim();
+                if (!next) return;
+                templates[next] = value;
+            };
+            store(parsed.templateName, parsed);
+            const normalized = lastSegment(parsed.templateName);
+            store(normalized, parsed);
+            registerCandidate({
+                id: parsed.templateName,
+                kind: 'template',
+                template: parsed,
+                lineNumber: parsed.lineNumber,
+                sourceRootNode: rootNode,
+                parseScopeNode: rootNode,
+                scopeKind: 'module',
+                sourceCode: code,
+                sourceFilePath: this.lastSourceFilePath,
+                sourceImports: new Map(this.imports)
+            });
+        };
+        const registerLiteral = (key: string, value: TSNode): void => {
+            const next = String(key || '').trim();
+            if (!next) return;
+            literalValues[next] = value;
+        };
+        const resolveLiteralNode = (node: TSNode): TSNode => {
+            if (node.type !== 'identifier' && node.type !== 'attribute') return node;
+            const raw = getNodeText(node, code).trim();
+            return (
+                literalValues[raw] ||
+                (raw.startsWith('self._') ? literalValues[raw.replace('self._', '')] : undefined) ||
+                (raw.startsWith('self.') ? literalValues[raw.replace('self.', '')] : undefined) ||
+                literalValues[lastSegment(raw)] ||
+                node
+            );
+        };
         const parseAllList = (listNode: TSNode): void => {
             for (const item of listNode.namedChildren) {
                 if (!item) continue;
@@ -919,34 +2730,166 @@ export class GraphParser {
             const right = first.childForFieldName('right');
             if (!left || !right) continue;
 
-            const leftText = getNodeText(left, code).trim();
+            const bindingNames = this.extractPatternBindingNames(left, code);
+            const leftText = bindingNames[0] || getNodeText(left, code).trim();
             if (leftText.toLowerCase() === '__all__' && right.type === 'list') {
                 parseAllList(right);
                 continue;
             }
 
-            if (right.type !== 'call') continue;
-            const fn = right.childForFieldName('function');
-            if (!fn) continue;
-            const fnText = getNodeText(fn, code).trim();
-            if (fnText !== 'NodeTemplate' && !fnText.endsWith('.NodeTemplate')) continue;
+            if (
+                bindingNames.length === 1 &&
+                (right.type === 'list' || right.type === 'tuple' || right.type === 'dictionary')
+            ) {
+                registerLiteral(leftText, right);
+                if (leftText.startsWith('self._')) registerLiteral(leftText.replace('self._', ''), right);
+                if (leftText.startsWith('self.')) registerLiteral(leftText.replace('self.', ''), right);
+                const last = leftText.split('.').pop();
+                if (last) registerLiteral(last, right);
+                if (last?.startsWith('_')) registerLiteral(last.slice(1), right);
+                continue;
+            }
 
-            const parsed = tryParseNodeTemplateAssignment(leftText, right, code);
-            if (!parsed) continue;
-            if (parsed.baseKind !== 'Graph' && parsed.baseKind !== 'Loop') continue;
-            candidates.push(parsed.templateName);
+            if (right.type !== 'call') continue;
+
+            const functionNode = right.childForFieldName('function');
+            const functionText = functionNode ? getNodeText(functionNode, code).trim() : '';
+            const normalizedFunction = functionText.includes('.') ? functionText.split('.').pop()! : functionText;
+            if (
+                bindingNames.length === 1 &&
+                (normalizedFunction === 'Graph' || normalizedFunction === 'Loop' || normalizedFunction === 'RootGraph')
+            ) {
+                registerCandidate({
+                    id: leftText,
+                    kind: 'assignment',
+                    graphKind: normalizedFunction,
+                    lineNumber: right.startPosition.row + 1,
+                    sourceRootNode: rootNode,
+                    parseScopeNode: rootNode,
+                    scopeKind: 'module',
+                    sourceCode: code,
+                    sourceFilePath: this.lastSourceFilePath,
+                    sourceImports: new Map(this.imports),
+                    sourceGraphVariable: leftText
+                });
+            }
+
+            if (bindingNames.length === 1) {
+                const parsed =
+                    tryParseNodeTemplateAssignment(leftText, right, code) ||
+                    this.resolveTemplateExpression(right, {
+                        preferredName: leftText,
+                        code,
+                        rootNode,
+                        imports: new Map(this.imports),
+                        sourceFilePath: this.lastSourceFilePath,
+                        templateBindings: { ...templates },
+                        exprBindings: { ...literalValues },
+                        depth: 0,
+                        visited: new Set<string>()
+                    });
+                if (parsed) {
+                    registerTemplate(
+                        this.enrichStandaloneTemplateChildren(parsed, {
+                            code,
+                            rootNode,
+                            imports: new Map(this.imports),
+                            sourceFilePath: this.lastSourceFilePath,
+                            templateBindings: templates,
+                            exprBindings: literalValues
+                        })
+                    );
+                    continue;
+                }
+            }
+
+            const returned = this.resolveFunctionCallToRenderables(right, {
+                preferredName: leftText,
+                code,
+                rootNode,
+                imports: new Map(this.imports),
+                sourceFilePath: this.lastSourceFilePath,
+                templateBindings: { ...templates },
+                exprBindings: { ...literalValues },
+                depth: 0,
+                visited: new Set<string>()
+            });
+            if (!returned?.length) continue;
+
+            if (bindingNames.length <= 1 && returned.length === 1 && leftText) {
+                registerCandidate(this.cloneRenderableCandidateWithAlias(returned[0], leftText, right.startPosition.row + 1));
+                continue;
+            }
+
+            const count = Math.min(bindingNames.length, returned.length);
+            for (let i = 0; i < count; i++) {
+                registerCandidate(
+                    this.cloneRenderableCandidateWithAlias(returned[i], bindingNames[i], right.startPosition.row + 1)
+                );
+            }
+        }
+
+        for (const child of rootNode.children) {
+            const functionDef = this.unwrapNamedDefinition(child, 'function_definition');
+            if (functionDef) {
+                const functionName = this.getDefinitionName(functionDef, code);
+                const functionMatch = this.findFunctionGraphScope(rootNode, code, functionName);
+                if (functionName && functionMatch && !hasEquivalentAssignmentCandidate(functionMatch)) {
+                    registerCandidate(
+                        this.createRenderableCandidateFromGraphScope(
+                            functionName,
+                            functionMatch,
+                            rootNode,
+                            code,
+                            new Map(this.imports),
+                            this.lastSourceFilePath
+                        )
+                    );
+                }
+                continue;
+            }
+
+            const classDef = this.unwrapNamedDefinition(child, 'class_definition');
+            if (!classDef) continue;
+            const className = this.getDefinitionName(classDef, code);
+            const classMatch = this.findClassGraphScope(rootNode, code, className);
+            if (!className || !classMatch || hasEquivalentAssignmentCandidate(classMatch)) continue;
+            registerCandidate(
+                this.createRenderableCandidateFromGraphScope(
+                    className,
+                    classMatch,
+                    rootNode,
+                    code,
+                    new Map(this.imports),
+                    this.lastSourceFilePath
+                )
+            );
         }
 
         if (candidates.length === 0) return null;
-
-        const lastSegment = (name: string): string => (name.includes('.') ? name.split('.').pop()! : name);
 
         const getTemplateStructure = (() => {
             const cache = new Map<string, ComponentStructure | null>();
             return (name: string): ComponentStructure | null => {
                 const key = lastSegment(name);
                 if (cache.has(key)) return cache.get(key) || null;
-                const s = parseTemplateStructure(code, name);
+                const template = templates[name] || templates[key];
+                const sourceCode = template?.sourceCode || code;
+                const scopedTemplate = template
+                    ? {
+                          ...template,
+                          scopedTemplates: {
+                              ...(template.scopedTemplates || {}),
+                              ...templates
+                          },
+                          literalValues: {
+                              ...(template.literalValues || {}),
+                              ...literalValues
+                          },
+                          sourceCode
+                      }
+                    : null;
+                const s = scopedTemplate ? buildTemplateStructure(scopedTemplate, sourceCode) : parseTemplateStructure(code, name);
                 cache.set(key, s);
                 return s;
             };
@@ -954,7 +2897,7 @@ export class GraphParser {
 
         const selectByPreferred = (): string | null => {
             const pref = typeof preferredTemplate === 'string' ? preferredTemplate.trim() : '';
-            if (!pref) return null;
+            if (!pref || pref === 'all') return null;
             const prefLast = lastSegment(pref);
             return candidates.find((c) => c === pref || lastSegment(c) === prefLast) || null;
         };
@@ -1029,41 +2972,360 @@ export class GraphParser {
             return best;
         };
 
-        const selected =
-            selectByPreferred() ||
-            selectByExports() ||
-            selectOutermost() ||
-            candidates[candidates.length - 1];
+        const buildGraphDataFromStructure = (
+            template: ParsedNodeTemplate,
+            structure: ComponentStructure
+        ): GraphData => {
+            const subgraphParents: { [child: string]: string } = {};
+            const subgraphTypes: { [parent: string]: string } = {};
+            for (const [parent, children] of Object.entries(structure.subgraphs || {})) {
+                for (const child of children || []) {
+                    subgraphParents[child] = parent;
+                }
 
-        const structure = getTemplateStructure(selected);
-        if (!structure) return null;
-
-        const subgraphParents: { [child: string]: string } = {};
-        const subgraphTypes: { [parent: string]: string } = {};
-        for (const [parent, children] of Object.entries(structure.subgraphs || {})) {
-            for (const child of children || []) {
-                subgraphParents[child] = parent;
+                const isLoop =
+                    (children || []).some((c) => c.endsWith('_controller') || c.endsWith('_terminate')) ||
+                    (children || []).some((c) => structure.nodeTypes?.[c] === 'Controller');
+                subgraphTypes[parent] = isLoop ? 'Loop' : 'Graph';
             }
 
-            const isLoop =
-                (children || []).some((c) => c.endsWith('_controller') || c.endsWith('_terminate')) ||
-                (children || []).some((c) => structure.nodeTypes?.[c] === 'Controller');
-            subgraphTypes[parent] = isLoop ? 'Loop' : 'Graph';
+            const graphType: GraphType =
+                structure.nodes.includes('controller') && structure.nodes.includes('terminate')
+                    ? 'Loop'
+                    : 'Graph';
+
+            return {
+                nodes: structure.nodes,
+                nodeTypes: structure.nodeTypes,
+                edges: structure.edges,
+                subgraphs: structure.subgraphs,
+                subgraphTypes,
+                subgraphParents,
+                nodeLineNumbers: structure.nodeLineNumbers,
+                nodePullKeys: structure.nodePullKeys,
+                nodePushKeys: structure.nodePushKeys,
+                nodeAttributes: structure.nodeAttributes,
+                graphType,
+                controlFlow: { forLoops: [], ifConditions: [], dependencies: [] },
+                loopControls: {},
+                warnings: [],
+                pendingBuilderCalls: {},
+                templateCandidates: candidates.slice(),
+                selectedTemplate: template.templateName,
+                graphCandidates: candidates.slice(),
+                selectedGraph: template.templateName
+            };
+        };
+
+        const buildNodeTemplateGraphData = (template: ParsedNodeTemplate): GraphData => {
+            const nodeId = lastSegment(template.templateName);
+            const nodeType = normalizeTypeName(template.nodeClass);
+            return {
+                nodes: [nodeId],
+                nodeTypes: { [nodeId]: nodeType || 'Node' },
+                edges: [],
+                subgraphs: {},
+                subgraphTypes: {},
+                subgraphParents: {},
+                nodeLineNumbers: { [nodeId]: template.lineNumber || 0 },
+                nodePullKeys: {
+                    [nodeId]:
+                        template.pullKeys !== undefined ? template.pullKeys : nodeType === 'Agent' ? 'empty' : null
+                },
+                nodePushKeys: {
+                    [nodeId]:
+                        template.pushKeys !== undefined ? template.pushKeys : nodeType === 'Agent' ? 'empty' : null
+                },
+                nodeAttributes: { [nodeId]: template.attributes ?? null },
+                graphType: 'Graph',
+                controlFlow: { forLoops: [], ifConditions: [], dependencies: [] },
+                loopControls: {},
+                warnings: [],
+                pendingBuilderCalls: {},
+                templateCandidates: candidates.slice(),
+                selectedTemplate: template.templateName,
+                graphCandidates: candidates.slice(),
+                selectedGraph: template.templateName
+            };
+        };
+
+        const getCandidateGraphData = (() => {
+            const cache = new Map<string, GraphData | null>();
+            return (name: string): GraphData | null => {
+                const key = lastSegment(name);
+                if (cache.has(key)) return cache.get(key) || null;
+
+                const candidate = candidateEntries[name];
+                if (!candidate) {
+                    cache.set(key, null);
+                    return null;
+                }
+
+                if (candidate.kind === 'template' && candidate.template?.baseKind === 'Node') {
+                    const nodeData = buildNodeTemplateGraphData(candidate.template);
+                    cache.set(key, nodeData);
+                    return nodeData;
+                }
+
+                if (candidate.kind === 'template' && candidate.template) {
+                    const structure = getTemplateStructure(name);
+                    if (!structure) {
+                        cache.set(key, null);
+                        return null;
+                    }
+
+                    const graphData = buildGraphDataFromStructure(candidate.template, structure);
+                    cache.set(key, graphData);
+                    return graphData;
+                }
+
+                if (candidate.kind === 'assignment' && candidate.graphKind) {
+                    const graphData = this.parseStandaloneAssignmentGraph(
+                        candidate.sourceRootNode || rootNode,
+                        candidate.parseScopeNode || candidate.sourceRootNode || rootNode,
+                        candidate.sourceCode || code,
+                        candidate.sourceGraphVariable || candidate.id,
+                        candidate.graphKind,
+                        controlFlowCtx,
+                        candidate.sourceImports,
+                        candidate.sourceFilePath,
+                        candidate.scopeKind || 'module'
+                    );
+                    cache.set(key, graphData);
+                    return graphData;
+                }
+
+                cache.set(key, null);
+                return null;
+            };
+        })();
+
+        const resolveCandidateIdFromTypeName = (rawType: string): string | null => {
+            const next = String(rawType || '').trim();
+            if (!next) return null;
+            const normalized = lastSegment(next);
+            return candidates.find((candidate) => candidate === next || lastSegment(candidate) === normalized) || null;
+        };
+
+        const resolveCandidateIdForNode = (node: TSNode): string | null => {
+            if (node.type === 'identifier' || node.type === 'attribute') {
+                const raw = getNodeText(node, code).trim();
+                return resolveCandidateIdFromTypeName(raw);
+            }
+            if (node.type !== 'call') return null;
+            const resolved = this.resolveTemplateExpression(node, {
+                preferredName: '__inline__',
+                code,
+                rootNode,
+                imports: new Map(this.imports),
+                sourceFilePath: this.lastSourceFilePath,
+                templateBindings: { ...templates },
+                exprBindings: { ...literalValues },
+                depth: 0,
+                visited: new Set<string>()
+            });
+            if (!resolved) return null;
+            return resolveCandidateIdFromTypeName(resolved.templateName);
+        };
+
+        const collectCandidateDependencies = (candidateId: string): Set<string> => {
+            const deps = new Set<string>();
+            const candidate = candidateEntries[candidateId];
+            if (!candidate) return deps;
+
+            if (candidate.kind === 'template' && candidate.template?.nodesArg) {
+                const nodesNode = resolveLiteralNode(candidate.template.nodesArg);
+                if (nodesNode.type === 'list') {
+                    for (const item of nodesNode.namedChildren) {
+                        if (!item || item.type !== 'tuple') continue;
+                        const elems = item.namedChildren.filter(
+                            (child): child is TSNode => !!child && child.type !== 'comment'
+                        );
+                        if (elems.length < 2) continue;
+                        const depId = resolveCandidateIdForNode(elems[1]);
+                        if (!depId || depId === candidateId) continue;
+                        deps.add(depId);
+                    }
+                }
+            }
+
+            if (candidate.kind === 'assignment') {
+                const assignmentNode = this.findTopLevelAssignmentRight(rootNode, code, [candidate.id]);
+                if (assignmentNode?.type === 'call') {
+                    const args = this.getCallArgs(assignmentNode);
+                    const kw = this.getKeywordArgMap(args, code);
+                    let nodesNode = kw.get('nodes') || null;
+                    if (!nodesNode) {
+                        const positional = this.getPositionalArgs(args);
+                        nodesNode =
+                            positional.find((arg) => resolveLiteralNode(arg).type === 'list') || null;
+                    }
+                    const resolvedNodes = nodesNode ? resolveLiteralNode(nodesNode) : null;
+                    if (resolvedNodes?.type === 'list') {
+                        for (const item of resolvedNodes.namedChildren) {
+                            if (!item || item.type !== 'tuple') continue;
+                            const elems = item.namedChildren.filter(
+                                (child): child is TSNode => !!child && child.type !== 'comment'
+                            );
+                            if (elems.length < 2) continue;
+                            const depId = resolveCandidateIdForNode(elems[1]);
+                            if (!depId || depId === candidateId) continue;
+                            deps.add(depId);
+                        }
+                    }
+                }
+            }
+
+            const data = getCandidateGraphData(candidateId);
+            if (data) {
+                for (const nodeType of Object.values(data.nodeTypes || {})) {
+                    const depId = resolveCandidateIdFromTypeName(nodeType);
+                    if (!depId || depId === candidateId) continue;
+                    deps.add(depId);
+                }
+            }
+
+            return deps;
+        };
+
+        const mergeAllCandidates = (selectedIds: string[]): GraphData | null => {
+            const merged: GraphData = {
+                nodes: [],
+                nodeTypes: {},
+                edges: [],
+                subgraphs: {},
+                subgraphTypes: {},
+                subgraphParents: {},
+                nodeLineNumbers: {},
+                nodePullKeys: {},
+                nodePushKeys: {},
+                nodeAttributes: {},
+                graphType: 'Graph',
+                controlFlow: { forLoops: [], ifConditions: [], dependencies: [] },
+                loopControls: {},
+                warnings: [],
+                pendingBuilderCalls: {},
+                templateCandidates: candidates.slice(),
+                selectedTemplate: 'all',
+                graphCandidates: candidates.slice(),
+                selectedGraph: 'all'
+            };
+
+            for (const candidateId of selectedIds) {
+                const candidate = candidateEntries[candidateId];
+                const data = getCandidateGraphData(candidateId);
+                if (!candidate || !data) continue;
+
+                if (candidate.kind === 'template' && candidate.template?.baseKind === 'Node') {
+                    const nodeData = buildNodeTemplateGraphData(candidate.template);
+                    const sourceNode = data.nodes[0];
+                    const nodeId = candidateId;
+                    if (!merged.nodes.includes(nodeId)) merged.nodes.push(nodeId);
+                    merged.nodeTypes[nodeId] =
+                        nodeData.nodeTypes[sourceNode] ||
+                        normalizeTypeName(candidate.template.nodeClass);
+                    merged.nodeLineNumbers[nodeId] =
+                        candidate.template.lineNumber || nodeData.nodeLineNumbers?.[sourceNode] || 0;
+                    merged.nodePullKeys[nodeId] = data.nodePullKeys?.[sourceNode] ?? null;
+                    merged.nodePushKeys[nodeId] = data.nodePushKeys?.[sourceNode] ?? null;
+                    merged.nodeAttributes[nodeId] = data.nodeAttributes?.[sourceNode] ?? null;
+                    continue;
+                }
+
+                const wrapperId = candidateId;
+                const prefix = `${wrapperId}_`;
+                if (!merged.nodes.includes(wrapperId)) merged.nodes.push(wrapperId);
+                merged.nodeTypes[wrapperId] =
+                    candidate.kind === 'template' && candidate.template
+                        ? normalizeTypeName(candidate.template.nodeClass) || (data.graphType === 'Loop' ? 'Loop' : 'Graph')
+                        : candidate.kind === 'assignment'
+                            ? candidate.graphKind || (data.graphType === 'Loop' ? 'Loop' : 'Graph')
+                            : data.graphType === 'Loop'
+                                ? 'Loop'
+                                : 'Graph';
+                merged.nodeLineNumbers[wrapperId] = candidate.lineNumber || 0;
+                merged.nodePullKeys[wrapperId] =
+                    candidate.kind === 'template' && candidate.template ? candidate.template.pullKeys ?? null : null;
+                merged.nodePushKeys[wrapperId] =
+                    candidate.kind === 'template' && candidate.template ? candidate.template.pushKeys ?? null : null;
+                merged.nodeAttributes[wrapperId] =
+                    candidate.kind === 'template' && candidate.template ? candidate.template.attributes ?? null : null;
+                merged.subgraphs[wrapperId] = [];
+                merged.subgraphTypes[wrapperId] =
+                    data.graphType === 'RootGraph' ? 'Graph' : data.graphType === 'Loop' ? 'Loop' : 'Graph';
+
+                for (const node of data.nodes) {
+                    const prefixed = `${prefix}${node}`;
+                    if (!merged.nodes.includes(prefixed)) merged.nodes.push(prefixed);
+                    merged.nodeTypes[prefixed] = data.nodeTypes[node] || 'Node';
+                    merged.nodeLineNumbers[prefixed] = data.nodeLineNumbers?.[node] || 0;
+                    merged.nodePullKeys[prefixed] = data.nodePullKeys?.[node] ?? null;
+                    merged.nodePushKeys[prefixed] = data.nodePushKeys?.[node] ?? null;
+                    merged.nodeAttributes[prefixed] = data.nodeAttributes?.[node] ?? null;
+                }
+
+                const topLevelNodes = data.nodes.filter((node) => !data.subgraphParents?.[node]);
+                for (const node of topLevelNodes) {
+                    const prefixed = `${prefix}${node}`;
+                    if (!merged.subgraphs[wrapperId].includes(prefixed)) merged.subgraphs[wrapperId].push(prefixed);
+                    merged.subgraphParents[prefixed] = wrapperId;
+                }
+
+                for (const [parent, children] of Object.entries(data.subgraphs || {})) {
+                    const prefixedParent = `${prefix}${parent}`;
+                    merged.subgraphs[prefixedParent] = children.map((child) => `${prefix}${child}`);
+                    merged.subgraphTypes[prefixedParent] =
+                        data.subgraphTypes?.[parent] ||
+                        (data.nodeTypes[parent] && data.nodeTypes[parent].includes('Loop') ? 'Loop' : 'Graph');
+                    if (data.subgraphParents?.[parent]) {
+                        merged.subgraphParents[prefixedParent] = `${prefix}${data.subgraphParents[parent]}`;
+                    } else if (topLevelNodes.includes(parent)) {
+                        merged.subgraphParents[prefixedParent] = wrapperId;
+                    }
+                    for (const child of children) {
+                        merged.subgraphParents[`${prefix}${child}`] = prefixedParent;
+                    }
+                }
+
+                for (const edge of data.edges || []) {
+                    merged.edges.push({
+                        ...edge,
+                        from: `${prefix}${edge.from}`,
+                        to: `${prefix}${edge.to}`
+                    });
+                }
+            }
+
+            return merged.nodes.length > 0 ? merged : null;
+        };
+
+        const explicitSelection = selectByPreferred();
+        const defaultSelection =
+            candidates.length > 1
+                ? 'all'
+                : selectByExports() || selectOutermost() || candidates[candidates.length - 1];
+        const selected = explicitSelection || defaultSelection;
+
+        const incoming = new Map<string, number>();
+        for (const candidate of candidates) incoming.set(candidate, 0);
+        for (const candidate of candidates) {
+            for (const dep of collectCandidateDependencies(candidate)) {
+                incoming.set(dep, (incoming.get(dep) || 0) + 1);
+            }
         }
 
-        const graphType: GraphType =
-            structure.nodes.includes('controller') && structure.nodes.includes('terminate')
-                ? 'Loop'
-                : 'Graph';
+        const rootCandidates = candidates.filter((candidate) => {
+            const entry = candidateEntries[candidate];
+            if (!entry) return false;
+            return (incoming.get(candidate) || 0) === 0;
+        });
+        const effectiveAllCandidates = rootCandidates.length > 0 ? rootCandidates : candidates.slice();
+
+        const chosen =
+            (selected === 'all' ? mergeAllCandidates(effectiveAllCandidates) : getCandidateGraphData(selected)) || null;
+        if (!chosen) return null;
 
         const warnings: string[] = [];
-        if (candidates.length > 1) {
-            warnings.push(
-                `Multiple NodeTemplate graphs found (${candidates
-                    .map((c) => lastSegment(c))
-                    .join(', ')}); previewing ${lastSegment(selected)}. Use the Template selector to switch.`
-            );
-        }
 
         // Keep warning semantics consistent with the main parser: if the file contains dynamic build logic,
         // the preview may be inaccurate. (Standalone templates are usually static, but keep best-effort.)
@@ -1075,25 +3337,13 @@ export class GraphParser {
             );
         }
 
-        return {
-            nodes: structure.nodes,
-            nodeTypes: structure.nodeTypes,
-            edges: structure.edges,
-            subgraphs: structure.subgraphs,
-            subgraphTypes,
-            subgraphParents,
-            nodeLineNumbers: structure.nodeLineNumbers,
-            nodePullKeys: structure.nodePullKeys,
-            nodePushKeys: structure.nodePushKeys,
-            nodeAttributes: structure.nodeAttributes,
-            graphType,
-            controlFlow: { forLoops: [], ifConditions: [], dependencies: [] },
-            loopControls,
-            warnings,
-            pendingBuilderCalls: {},
-            templateCandidates: candidates.slice(),
-            selectedTemplate: selected
-        };
+        chosen.loopControls = loopControls;
+        chosen.warnings = [...(chosen.warnings || []), ...warnings];
+        chosen.templateCandidates = candidates.slice();
+        chosen.graphCandidates = candidates.slice();
+        chosen.selectedTemplate = selected;
+        chosen.selectedGraph = selected;
+        return chosen;
     }
 
     // ==================== Compatibility Methods ====================
@@ -1383,10 +3633,22 @@ export class GraphParser {
         subgraphs: { [parent: string]: string[] },
         controlFlowCtx?: ControlFlowContext
     ): void {
+        const ensureTopLevelEndpoints = (kind: GraphType): void => {
+            if (kind === 'Loop') return;
+            if (!nodeCtx.nodes.includes('controller') || !nodeCtx.nodes.includes('terminate')) return;
+            nodeCtx.nodes.length = 0;
+            nodeCtx.nodes.push('entry', 'exit');
+            delete nodeCtx.nodeTypes['controller'];
+            delete nodeCtx.nodeTypes['terminate'];
+            nodeCtx.nodeTypes['entry'] = 'entry';
+            nodeCtx.nodeTypes['exit'] = 'exit';
+        };
+
         // First try module-level code
         let rootGraphVariable = findRootGraphVariable(rootNode, code);
         
         if (rootGraphVariable) {
+            ensureTopLevelEndpoints(this.inferNonClassGraphType(rootNode, code));
             console.log('[Parser] Found RootGraph at module level');
             console.log(`[Parser] RootGraph variable: ${rootGraphVariable}`);
             parseModuleLevel(rootNode, code, nodeCtx, edgeCtx, subgraphs, rootGraphVariable, controlFlowCtx);
@@ -1394,6 +3656,7 @@ export class GraphParser {
             // Try to find RootGraph inside a function (e.g., main())
             const funcWithGraph = findFunctionWithRootGraph(rootNode, code);
             if (funcWithGraph) {
+                ensureTopLevelEndpoints(this.inferNonClassGraphType(funcWithGraph.funcBody, code));
                 console.log(`[Parser] Found RootGraph inside function: ${funcWithGraph.funcName}`);
                 console.log(`[Parser] RootGraph variable: ${funcWithGraph.rootGraphVar}`);
                 parseFunctionBody(funcWithGraph.funcBody, code, nodeCtx, edgeCtx, subgraphs, funcWithGraph.rootGraphVar, controlFlowCtx);

@@ -13,13 +13,19 @@ const preview = usePreviewStore();
 
 const props = defineProps<{ visible: boolean }>();
 
+const previewRoot = ref<HTMLDivElement | null>(null);
 const cyContainer = ref<HTMLDivElement | null>(null);
 const overlayContainer = ref<HTMLDivElement | null>(null);
+const controlPanelRef = ref<HTMLDivElement | null>(null);
 let cy: Core | null = null;
 let overlayMgr: GraphAttrsOverlayManager | null = null;
 let pendingRender = false;
 
 const MAX_LOOP_ITERATIONS = 8;
+const CONTROL_PANEL_MIN_WIDTH = 240;
+const CONTROL_PANEL_MIN_HEIGHT = 140;
+const CONTROL_PANEL_MARGIN = 10;
+const CONTROL_PANEL_HEADER_HEIGHT = 42;
 const adjacencyPlaceholder =
   'Enter edges in format:\nfrom_index, to_index, keys\nExample:\n1, 2, {"data": "input"}\n2, 3, {"processed": "result"}';
 
@@ -27,11 +33,17 @@ const currentDocState = computed(() => preview.currentDocState);
 const currentEdgeStyle = computed<EdgeStyleMode>(() => (currentDocState.value?.edgeStyle as EdgeStyleMode) || 'fan');
 
 const templateCandidates = computed<string[]>(() => {
-  const raw = (preview.graph as any)?.templateCandidates;
+  const raw = (preview.graph as any)?.graphCandidates ?? (preview.graph as any)?.templateCandidates;
   if (!Array.isArray(raw)) return [];
   return raw.filter((x: any) => typeof x === 'string' && x.trim()).map((x: any) => String(x).trim());
 });
-const selectedTemplate = computed<string>(() => currentDocState.value?.templateName || '');
+const templateOptions = computed<string[]>(() => {
+  if (templateCandidates.value.length <= 1) return [...templateCandidates.value];
+  return ['all', ...templateCandidates.value];
+});
+const selectedTemplate = computed<string>(
+  () => currentDocState.value?.templateName || (preview.graph as any)?.selectedGraph || (templateCandidates.value.length > 1 ? 'all' : '')
+);
 
 const isReadyToRender = computed(() => !!preview.graph && !!preview.documentUri);
 const loadingText = computed(() => preview.clearReason || 'Waiting for Python code…');
@@ -41,6 +53,206 @@ const allWarnings = computed<string[]>(() => {
   const w2 = Array.isArray(w2Raw) ? w2Raw.filter((x: any) => typeof x === 'string') : [];
   return [...w1, ...w2];
 });
+const previewContextMenu = ref<{
+  visible: boolean;
+  x: number;
+  y: number;
+  kind: 'node' | 'subgraph' | null;
+  nodeId: string;
+}>({
+  visible: false,
+  x: 0,
+  y: 0,
+  kind: null,
+  nodeId: ''
+});
+const controlPanelState = computed(() => {
+  const panel = currentDocState.value?.controlPanel;
+  return {
+    x: Number(panel?.x ?? 10),
+    y: Number(panel?.y ?? 10),
+    width: Number(panel?.width ?? 320),
+    height: Number(panel?.height ?? 560),
+    collapsed: !!panel?.collapsed
+  };
+});
+const controlPanelStyle = computed<Record<string, string>>(() => {
+  const state = controlPanelState.value;
+  const out: Record<string, string> = {
+    left: `${state.x}px`,
+    top: `${state.y}px`,
+    width: `${state.width}px`
+  };
+  if (!state.collapsed) {
+    out.height = `${state.height}px`;
+    out.maxHeight = `min(${state.height}px, calc(100% - ${CONTROL_PANEL_MARGIN * 2}px))`;
+  }
+  return out;
+});
+
+let panelDragMove: ((e: MouseEvent) => void) | null = null;
+let panelDragUp: (() => void) | null = null;
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function getPreviewBounds(): { width: number; height: number } {
+  const rect = previewRoot.value?.getBoundingClientRect();
+  return {
+    width: Math.max(0, Math.floor(rect?.width ?? 0)),
+    height: Math.max(0, Math.floor(rect?.height ?? 0))
+  };
+}
+
+function normalizeControlPanelState(
+  patch: Partial<{ x: number; y: number; width: number; height: number; collapsed: boolean }>
+): { x: number; y: number; width: number; height: number; collapsed: boolean } {
+  const current = controlPanelState.value;
+  const bounds = getPreviewBounds();
+  const widthLimit = Math.max(CONTROL_PANEL_MIN_WIDTH, bounds.width - CONTROL_PANEL_MARGIN * 2);
+  const heightLimit = Math.max(CONTROL_PANEL_MIN_HEIGHT, bounds.height - CONTROL_PANEL_MARGIN * 2);
+  const width = clamp(
+    Math.round(Number(patch.width ?? current.width)),
+    CONTROL_PANEL_MIN_WIDTH,
+    widthLimit || CONTROL_PANEL_MIN_WIDTH
+  );
+  const collapsed = typeof patch.collapsed === 'boolean' ? patch.collapsed : current.collapsed;
+  const minHeight = collapsed ? CONTROL_PANEL_HEADER_HEIGHT : CONTROL_PANEL_MIN_HEIGHT;
+  const height = clamp(
+    Math.round(Number(patch.height ?? current.height)),
+    minHeight,
+    Math.max(minHeight, heightLimit || minHeight)
+  );
+  const maxX = Math.max(CONTROL_PANEL_MARGIN, bounds.width - width - CONTROL_PANEL_MARGIN);
+  const maxY = Math.max(CONTROL_PANEL_MARGIN, bounds.height - height - CONTROL_PANEL_MARGIN);
+  return {
+    x: clamp(Math.round(Number(patch.x ?? current.x)), CONTROL_PANEL_MARGIN, maxX),
+    y: clamp(Math.round(Number(patch.y ?? current.y)), CONTROL_PANEL_MARGIN, maxY),
+    width,
+    height,
+    collapsed
+  };
+}
+
+function setControlPanelState(
+  patch: Partial<{ x: number; y: number; width: number; height: number; collapsed: boolean }>
+): void {
+  preview.setControlPanelState(normalizeControlPanelState(patch));
+}
+
+function startControlPanelDrag(e: MouseEvent): void {
+  if (e.button !== 0) return;
+  if (!previewRoot.value) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const start = controlPanelState.value;
+  const originX = e.clientX;
+  const originY = e.clientY;
+  const prevCursor = document.body.style.cursor;
+  const prevUserSelect = document.body.style.userSelect;
+  document.body.style.cursor = 'move';
+  document.body.style.userSelect = 'none';
+
+  panelDragMove = (evt: MouseEvent) => {
+    const dx = evt.clientX - originX;
+    const dy = evt.clientY - originY;
+    setControlPanelState({ x: start.x + dx, y: start.y + dy });
+  };
+  panelDragUp = () => {
+    if (panelDragMove) window.removeEventListener('mousemove', panelDragMove, true);
+    if (panelDragUp) window.removeEventListener('mouseup', panelDragUp, true);
+    panelDragMove = null;
+    panelDragUp = null;
+    document.body.style.cursor = prevCursor;
+    document.body.style.userSelect = prevUserSelect;
+  };
+
+  window.addEventListener('mousemove', panelDragMove, true);
+  window.addEventListener('mouseup', panelDragUp, true);
+}
+
+function startControlPanelResize(e: MouseEvent): void {
+  if (e.button !== 0) return;
+  if (!previewRoot.value) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const start = controlPanelState.value;
+  const originX = e.clientX;
+  const originY = e.clientY;
+  const prevCursor = document.body.style.cursor;
+  const prevUserSelect = document.body.style.userSelect;
+  document.body.style.cursor = 'nwse-resize';
+  document.body.style.userSelect = 'none';
+
+  panelDragMove = (evt: MouseEvent) => {
+    const dx = evt.clientX - originX;
+    const dy = evt.clientY - originY;
+    setControlPanelState({ width: start.width + dx, height: start.height + dy });
+  };
+  panelDragUp = () => {
+    if (panelDragMove) window.removeEventListener('mousemove', panelDragMove, true);
+    if (panelDragUp) window.removeEventListener('mouseup', panelDragUp, true);
+    panelDragMove = null;
+    panelDragUp = null;
+    document.body.style.cursor = prevCursor;
+    document.body.style.userSelect = prevUserSelect;
+  };
+
+  window.addEventListener('mousemove', panelDragMove, true);
+  window.addEventListener('mouseup', panelDragUp, true);
+}
+
+function toggleControlPanelCollapsed(): void {
+  const nextCollapsed = !controlPanelState.value.collapsed;
+  setControlPanelState({
+    collapsed: nextCollapsed,
+    height: nextCollapsed ? CONTROL_PANEL_HEADER_HEIGHT : Math.max(controlPanelState.value.height, 360)
+  });
+}
+
+function normalizeControlPanelWithinViewport(): void {
+  if (!preview.documentUri) return;
+  setControlPanelState({});
+}
+
+function closePreviewContextMenu(): void {
+  previewContextMenu.value = {
+    visible: false,
+    x: 0,
+    y: 0,
+    kind: null,
+    nodeId: ''
+  };
+}
+
+function openPreviewContextMenu(kind: 'node' | 'subgraph', nodeId: string, event: MouseEvent): void {
+  const rect = previewRoot.value?.getBoundingClientRect();
+  if (!rect) return;
+  previewContextMenu.value = {
+    visible: true,
+    x: Math.max(8, Math.round(event.clientX - rect.left)),
+    y: Math.max(8, Math.round(event.clientY - rect.top)),
+    kind,
+    nodeId
+  };
+}
+
+function locateFromContextMenu(): void {
+  const nodeId = previewContextMenu.value.nodeId;
+  closePreviewContextMenu();
+  if (!nodeId) return;
+  navigateToNode(nodeId);
+}
+
+function toggleSubgraphFromContextMenu(): void {
+  const nodeId = previewContextMenu.value.nodeId;
+  closePreviewContextMenu();
+  if (!nodeId) return;
+  toggleSubgraph(nodeId);
+}
 
 type AdjacencyDraft = { text: string; error: string | null };
 const adjacencyDrafts = reactive<Record<string, AdjacencyDraft>>({});
@@ -73,17 +285,19 @@ function getDocUri(): string | null {
 
 function formatTemplateName(name: string): string {
   const s = String(name || '').trim();
+  if (!s || s === 'all') return 'All';
   if (!s) return '(unknown)';
   return s.includes('.') ? s.split('.').pop() || s : s;
 }
 
 function onTemplateChanged(next: string): void {
   const templateName = typeof next === 'string' ? next.trim() : '';
-  preview.setTemplateName(templateName || null);
+  const normalized = !templateName || templateName === 'all' ? null : templateName;
+  preview.setTemplateName(normalized);
   postMessage({
     type: 'templateSelectionChanged',
     documentUri: getDocUri() || undefined,
-    templateName: templateName || null
+    templateName: normalized
   });
 }
 
@@ -451,6 +665,27 @@ function attachCyHandlers(): void {
     }
   });
 
+  cy.on('tap', () => {
+    closePreviewContextMenu();
+  });
+
+  cy.on('cxttap', (evt) => {
+    if (evt.target === cy) closePreviewContextMenu();
+  });
+
+  cy.on('cxttap', 'node', (evt: EventObjectNode) => {
+    const node = evt.target;
+    const nodeId = node.id();
+    const nodeType = String(node.data('type') || 'Node');
+    if (isInternalNodeId(nodeId, nodeType)) {
+      closePreviewContextMenu();
+      return;
+    }
+    const oe = (evt as any).originalEvent as MouseEvent | undefined;
+    if (!oe) return;
+    openPreviewContextMenu(node.isParent && node.isParent() ? 'subgraph' : 'node', nodeId, oe);
+  });
+
   // Tooltip state shared by node/edge hovers.
   let tooltip: HTMLDivElement | null = null;
   let mousemoveHandler: ((e: any) => void) | null = null;
@@ -666,6 +901,7 @@ function attachCyHandlers(): void {
   cy.container()?.addEventListener('mouseleave', () => clearTooltip());
 
   cy.on('click', 'node', (evt: EventObjectNode) => {
+    closePreviewContextMenu();
     const n = evt.target;
     const nodeId = n.id();
     const nodeType = String(n.data('type') || 'Node');
@@ -675,11 +911,13 @@ function attachCyHandlers(): void {
   });
 
   cy.on('click', 'edge', (evt: EventObjectEdge) => {
+    closePreviewContextMenu();
     const e = evt.target;
     navigateToEdge(e.id());
   });
 
   cy.on('pan zoom', () => {
+    closePreviewContextMenu();
     overlayMgr?.scheduleUpdate('all');
     try {
       preview.setViewport(cy!.zoom(), cy!.pan());
@@ -689,6 +927,7 @@ function attachCyHandlers(): void {
   });
 
   cy.on('drag', 'node', (evt: EventObjectNode) => {
+    closePreviewContextMenu();
     try {
       const n = evt.target;
       const affected: string[] = [];
@@ -728,6 +967,7 @@ function attachCyHandlers(): void {
 onMounted(() => {
   ensureCyDagreRegistered();
   if (!cyContainer.value) return;
+  window.addEventListener('resize', normalizeControlPanelWithinViewport);
 
   cy = cytoscape({
     container: cyContainer.value,
@@ -751,6 +991,7 @@ onMounted(() => {
   attachCyHandlers();
 
   void nextTick().then(() => {
+    normalizeControlPanelWithinViewport();
     try {
       cy?.resize();
     } catch {
@@ -761,6 +1002,11 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener('resize', normalizeControlPanelWithinViewport);
+  if (panelDragMove) window.removeEventListener('mousemove', panelDragMove, true);
+  if (panelDragUp) window.removeEventListener('mouseup', panelDragUp, true);
+  panelDragMove = null;
+  panelDragUp = null;
   overlayMgr?.dispose();
   overlayMgr = null;
   try {
@@ -775,8 +1021,18 @@ watch(
   () => [preview.graph, preview.documentUri],
   async () => {
     await nextTick();
+    normalizeControlPanelWithinViewport();
     if (!cy) return;
     tryRenderGraph();
+  }
+);
+
+watch(
+  () => props.visible,
+  async (visible) => {
+    if (!visible) return;
+    await nextTick();
+    normalizeControlPanelWithinViewport();
   }
 );
 
@@ -845,137 +1101,187 @@ watch(
 </script>
 
 <template>
-  <div class="preview-root">
+  <div ref="previewRoot" class="preview-root" @mousedown="closePreviewContextMenu" @contextmenu.prevent>
     <div id="loading" v-show="!isReadyToRender">{{ loadingText }}</div>
 
-    <div id="controlPanel" v-show="isReadyToRender">
-      <div id="viewSection" class="control-section">
-        <h3>View</h3>
-        <button id="refreshViewButton" title="Re-render graph without clearing cached layout/state" @click="refreshGraph">
-          Refresh
-        </button>
-        <button id="resetViewButton" title="Clear cached layout/state for this file and reload" @click="resetViewState">
-          Reset (Clear Cache)
-        </button>
-      </div>
-
-      <div id="templateSection" class="control-section" v-show="templateCandidates.length > 1">
-        <h3>Template</h3>
-        <div class="control-item">
-          <label for="templateSelect">NodeTemplate graph</label>
-          <select
-            id="templateSelect"
-            :value="selectedTemplate"
-            @change="(e:any)=>onTemplateChanged(String(e.target.value))"
+    <div
+      v-show="isReadyToRender"
+      id="controlPanel"
+      ref="controlPanelRef"
+      :class="{ collapsed: controlPanelState.collapsed }"
+      :style="controlPanelStyle"
+    >
+      <div class="control-panel-header" @mousedown="startControlPanelDrag">
+        <div class="control-panel-title">Preview Controls</div>
+        <div class="control-panel-actions">
+          <button
+            class="control-panel-icon"
+            type="button"
+            :title="controlPanelState.collapsed ? 'Expand panel' : 'Collapse panel'"
+            @mousedown.stop
+            @click.stop="toggleControlPanelCollapsed"
           >
-            <option v-for="t in templateCandidates" :key="t" :value="t">
-              {{ formatTemplateName(t) }}
-            </option>
-          </select>
+            {{ controlPanelState.collapsed ? '▸' : '▾' }}
+          </button>
         </div>
       </div>
 
-      <div id="conditionSection" class="control-section" v-show="preview.conditionVariables.length > 0">
-        <h3>Conditional Branches</h3>
-        <div id="conditionControls">
-          <div v-for="condVar in preview.conditionVariables" :key="condVar" class="control-item">
-            <label :title="condVar">{{ formatConditionLabel(condVar) }}</label>
-            <select
-              :value="String((currentDocState?.conditions?.[condVar] ?? true) ? 'true' : 'false')"
-              @change="(e:any)=>onConditionChanged(condVar, String(e.target.value)==='true')"
-            >
-              <option value="true">True</option>
-              <option value="false">False</option>
-            </select>
-          </div>
+      <div v-show="!controlPanelState.collapsed" class="control-panel-body">
+        <div id="viewSection" class="control-section">
+          <h3>View</h3>
+          <button id="refreshViewButton" title="Re-render graph without clearing cached layout/state" @click="refreshGraph">
+            Refresh
+          </button>
+          <button id="resetViewButton" title="Clear cached layout/state for this file and reload" @click="resetViewState">
+            Reset (Clear Cache)
+          </button>
         </div>
-      </div>
 
-      <div id="loopSection" class="control-section" v-show="Object.keys(preview.loopControls).length > 0">
-        <h3>Loop Iterations</h3>
-        <div id="loopControls">
-          <div v-for="(info, loopId) in preview.loopControls" :key="loopId" class="control-item">
-            <label :title="info.label || String(loopId)">{{ formatLoopLabel(String(loopId), info) }}</label>
+        <div id="templateSection" class="control-section" v-show="templateOptions.length > 1">
+          <h3>Renderable</h3>
+          <div class="control-item">
+            <label for="templateSelect">Select object</label>
             <select
-              :value="String(Math.max(1, Math.min(MAX_LOOP_ITERATIONS, Number(currentDocState?.loopIterations?.[loopId] ?? info.defaultIterations ?? 1))))"
-              @change="(e:any)=>preview.setLoopIterations({ ...collectLoopIterations(), [loopId]: Number(e.target.value) })"
+              id="templateSelect"
+              :value="selectedTemplate"
+              @change="(e:any)=>onTemplateChanged(String(e.target.value))"
             >
-              <option v-for="i in MAX_LOOP_ITERATIONS" :key="i" :value="String(i)">
-                {{ i }} iteration{{ i > 1 ? 's' : '' }}
+              <option v-for="t in templateOptions" :key="t" :value="t">
+                {{ formatTemplateName(t) }}
               </option>
             </select>
           </div>
         </div>
-        <button id="loopApplyButton" @click="onLoopIterationsApply">Apply Loop Iterations</button>
-      </div>
 
-      <div
-        id="adjacencyGraphSection"
-        class="control-section"
-        v-show="Object.keys(preview.adjacencyGraphControls).length > 0"
-      >
-        <h3>Adjacency Graphs</h3>
-        <div id="adjacencyGraphControls">
-          <div
-            v-for="(control, graphVariable) in preview.adjacencyGraphControls"
-            :key="graphVariable"
-            class="adjacency-graph-item"
-          >
-            <div class="adjacency-graph-header">{{ control.label || graphVariable }}</div>
-            <div class="adjacency-graph-edges">
-              <div class="adjacency-node-info">
-                <small>
-                  Nodes:
-                  {{
-                    control.nodeInfo.map((n) => `${n.index}:${n.name}(${n.type})`).join(', ')
-                  }}
-                </small>
+        <div id="conditionSection" class="control-section" v-show="preview.conditionVariables.length > 0">
+          <h3>Conditional Branches</h3>
+          <div id="conditionControls">
+            <div v-for="condVar in preview.conditionVariables" :key="condVar" class="control-item">
+              <label :title="condVar">{{ formatConditionLabel(condVar) }}</label>
+              <select
+                :value="String((currentDocState?.conditions?.[condVar] ?? true) ? 'true' : 'false')"
+                @change="(e:any)=>onConditionChanged(condVar, String(e.target.value)==='true')"
+              >
+                <option value="true">True</option>
+                <option value="false">False</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div id="loopSection" class="control-section" v-show="Object.keys(preview.loopControls).length > 0">
+          <h3>Loop Iterations</h3>
+          <div id="loopControls">
+            <div v-for="(info, loopId) in preview.loopControls" :key="loopId" class="control-item">
+              <label :title="info.label || String(loopId)">{{ formatLoopLabel(String(loopId), info) }}</label>
+              <select
+                :value="String(Math.max(1, Math.min(MAX_LOOP_ITERATIONS, Number(currentDocState?.loopIterations?.[loopId] ?? info.defaultIterations ?? 1))))"
+                @change="(e:any)=>preview.setLoopIterations({ ...collectLoopIterations(), [loopId]: Number(e.target.value) })"
+              >
+                <option v-for="i in MAX_LOOP_ITERATIONS" :key="i" :value="String(i)">
+                  {{ i }} iteration{{ i > 1 ? 's' : '' }}
+                </option>
+              </select>
+            </div>
+          </div>
+          <button id="loopApplyButton" @click="onLoopIterationsApply">Apply Loop Iterations</button>
+        </div>
+
+        <div
+          id="adjacencyGraphSection"
+          class="control-section"
+          v-show="Object.keys(preview.adjacencyGraphControls).length > 0"
+        >
+          <h3>Adjacency Graphs</h3>
+          <div id="adjacencyGraphControls">
+            <div
+              v-for="(control, graphVariable) in preview.adjacencyGraphControls"
+              :key="graphVariable"
+              class="adjacency-graph-item"
+            >
+              <div class="adjacency-graph-header">{{ control.label || graphVariable }}</div>
+              <div class="adjacency-graph-edges">
+                <div class="adjacency-node-info">
+                  <small>
+                    Nodes:
+                    {{
+                      control.nodeInfo.map((n) => `${n.index}:${n.name}(${n.type})`).join(', ')
+                    }}
+                  </small>
+                </div>
+                <textarea
+                  class="adjacency-edge-input"
+                  rows="5"
+                  :placeholder="adjacencyPlaceholder"
+                  :value="ensureAdjacencyDraft(String(graphVariable)).text"
+                  @input="(e:any)=>{ const d=ensureAdjacencyDraft(String(graphVariable)); d.text=e.target.value; d.error=null; }"
+                />
+                <div v-if="ensureAdjacencyDraft(String(graphVariable)).error" class="hint warn">
+                  {{ ensureAdjacencyDraft(String(graphVariable)).error }}
+                </div>
+                <button class="adjacency-apply-button" type="button" @click="onAdjacencyApply(String(graphVariable))">
+                  Apply Structure
+                </button>
               </div>
-              <textarea
-                class="adjacency-edge-input"
-                rows="5"
-                :placeholder="adjacencyPlaceholder"
-                :value="ensureAdjacencyDraft(String(graphVariable)).text"
-                @input="(e:any)=>{ const d=ensureAdjacencyDraft(String(graphVariable)); d.text=e.target.value; d.error=null; }"
-              />
-              <div v-if="ensureAdjacencyDraft(String(graphVariable)).error" class="hint warn">
-                {{ ensureAdjacencyDraft(String(graphVariable)).error }}
-              </div>
-              <button class="adjacency-apply-button" type="button" @click="onAdjacencyApply(String(graphVariable))">
-                Apply Structure
-              </button>
+            </div>
+          </div>
+        </div>
+
+        <div id="edgeStyleSection" class="control-section" v-show="isReadyToRender">
+          <h3>Edge Style</h3>
+          <div class="control-item">
+            <label for="edgeStyleSelect">Edge style</label>
+            <select id="edgeStyleSelect" :value="currentEdgeStyle" @change="(e:any)=>onEdgeStyleChanged(e.target.value)">
+              <option value="fan">Fan Out (default)</option>
+              <option value="straight">Straight</option>
+            </select>
+          </div>
+        </div>
+
+        <div
+          id="warningSection"
+          class="control-section"
+          v-show="allWarnings.length > 0"
+        >
+          <h3>Warnings</h3>
+          <div id="warningList">
+            <div v-for="(w, i) in allWarnings" :key="i" class="warning-item">
+              {{ w }}
             </div>
           </div>
         </div>
       </div>
 
-      <div id="edgeStyleSection" class="control-section" v-show="isReadyToRender">
-        <h3>Edge Style</h3>
-        <div class="control-item">
-          <label for="edgeStyleSelect">Edge style</label>
-          <select id="edgeStyleSelect" :value="currentEdgeStyle" @change="(e:any)=>onEdgeStyleChanged(e.target.value)">
-            <option value="fan">Fan Out (default)</option>
-            <option value="straight">Straight</option>
-          </select>
-        </div>
-      </div>
-
       <div
-        id="warningSection"
-        class="control-section"
-        v-show="allWarnings.length > 0"
-      >
-        <h3>Warnings</h3>
-        <div id="warningList">
-          <div v-for="(w, i) in allWarnings" :key="i" class="warning-item">
-            {{ w }}
-          </div>
-        </div>
-      </div>
+        v-show="!controlPanelState.collapsed"
+        class="control-panel-resize"
+        title="Drag to resize preview controls panel"
+        @mousedown="startControlPanelResize"
+      ></div>
     </div>
 
     <div id="cy" ref="cyContainer"></div>
     <div id="graphAttrsContainer" ref="overlayContainer"></div>
+    <div
+      v-if="previewContextMenu.visible"
+      class="preview-ctx-menu"
+      :style="{ left: `${previewContextMenu.x}px`, top: `${previewContextMenu.y}px` }"
+      @mousedown.stop
+    >
+      <button
+        v-if="previewContextMenu.kind === 'subgraph'"
+        class="preview-ctx-item"
+        type="button"
+        @click="toggleSubgraphFromContextMenu"
+      >
+        {{
+          currentDocState?.collapsedSubgraphs?.[previewContextMenu.nodeId]
+            ? 'Expand'
+            : 'Collapse'
+        }}
+      </button>
+      <button class="preview-ctx-item" type="button" @click="locateFromContextMenu">Locate</button>
+    </div>
   </div>
 </template>
 
@@ -1008,18 +1314,81 @@ watch(
 
 #controlPanel {
   position: absolute;
-  top: 10px;
-  left: 10px;
-  width: 320px;
-  max-height: calc(100% - 20px);
-  overflow-y: auto;
   z-index: 1000;
-  padding: 12px;
   border-radius: 8px;
   border: 1px solid var(--vscode-panel-border, #2d2d2d);
   background: rgba(30, 30, 30, 0.95);
   color: var(--vscode-editor-foreground);
   font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+#controlPanel.collapsed {
+  height: auto;
+}
+
+.control-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: move;
+  user-select: none;
+}
+
+#controlPanel.collapsed .control-panel-header {
+  border-bottom: none;
+}
+
+.control-panel-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.control-panel-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.control-panel-icon {
+  width: 28px !important;
+  min-width: 28px;
+  height: 24px;
+  padding: 0 !important;
+  border-radius: 6px !important;
+}
+
+.control-panel-body {
+  overflow-y: auto;
+  padding: 12px;
+  min-height: 0;
+}
+
+.control-panel-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+}
+
+.control-panel-resize::before {
+  content: '';
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 10px;
+  height: 10px;
+  border-right: 2px solid rgba(255, 255, 255, 0.28);
+  border-bottom: 2px solid rgba(255, 255, 255, 0.28);
 }
 
 #controlPanel h3 {
@@ -1354,5 +1723,31 @@ watch(
 
 .adjacency-node-info {
   opacity: 0.8;
+}
+
+.preview-ctx-menu {
+  position: absolute;
+  z-index: 2200;
+  min-width: 160px;
+  padding: 6px;
+  border-radius: 8px;
+  border: 1px solid var(--vscode-panel-border, #2d2d2d);
+  background: rgba(30, 30, 30, 0.98);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.preview-ctx-item {
+  width: 100% !important;
+  display: block;
+  text-align: left;
+  padding: 7px 8px !important;
+  border-radius: 6px !important;
+  border: none !important;
+  background: transparent !important;
+  color: var(--vscode-editor-foreground) !important;
+}
+
+.preview-ctx-item:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
 }
 </style>

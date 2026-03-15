@@ -124,6 +124,11 @@ function inferContainerKind(
     return null;
 }
 
+function normalizeTypeLabel(rawTypeText: string): string {
+    const normalized = rawTypeText.includes('.') ? rawTypeText.split('.').pop()! : rawTypeText;
+    return normalized || 'Node';
+}
+
 function parseNodesListLiteral(
     node: TSNode,
     code: string,
@@ -307,127 +312,199 @@ export function parseTemplateStructure(
         if (!target) {
             return null;
         }
-        if (target.baseKind !== 'Graph' && target.baseKind !== 'Loop') {
-            return null;
-        }
-
-        const baseType = target.baseKind;
-
-        // Initialize internal nodes
-        const nodes: string[] = [];
-        const nodeTypes: { [key: string]: string } = {};
-        const nodeLineNumbers: { [key: string]: number } = {};
-        if (baseType === 'Loop') {
-            nodes.push('controller', 'terminate');
-            nodeTypes['controller'] = 'Controller';
-            nodeTypes['terminate'] = 'TerminateNode';
-        } else {
-            nodes.push('entry', 'exit');
-            nodeTypes['entry'] = 'entry';
-            nodeTypes['exit'] = 'exit';
-        }
-
-        const nodePullKeys: { [key: string]: { [key: string]: any } | null | 'empty' } = {};
-        const nodePushKeys: { [key: string]: { [key: string]: any } | null | 'empty' } = {};
-        const nodeAttributes: { [key: string]: { [key: string]: any } | null } = {};
-        const edges: GraphEdge[] = [];
-        const subgraphs: { [parent: string]: string[] } = {};
-
-        // Expand root container (no prefix) and recursively expand nested containers with prefixing.
-        const expandContainer = (
-            containerKey: string,
-            kind: 'Graph' | 'Loop',
-            nodesNode: TSNode | undefined,
-            edgesNode: TSNode | undefined
-        ) => {
-            const prefix = containerKey ? `${containerKey}_` : '';
-
-            if (nodesNode) {
-                const specs = parseNodesListLiteral(nodesNode, componentCode, literalValues);
-                for (const spec of specs) {
-                    const fullName = `${prefix}${spec.name}`;
-                    if (!nodes.includes(fullName)) nodes.push(fullName);
-                    if (!nodeTypes[fullName]) nodeTypes[fullName] = spec.typeText || 'Node';
-                    if (!nodeLineNumbers[fullName]) nodeLineNumbers[fullName] = spec.lineNumber;
-
-                    if (containerKey) {
-                        if (!subgraphs[containerKey]) subgraphs[containerKey] = [];
-                        if (!subgraphs[containerKey].includes(fullName)) subgraphs[containerKey].push(fullName);
-                    }
-
-                    const templateInfo =
-                        templates[spec.typeText] ||
-                        templates[spec.typeText.includes('.') ? spec.typeText.split('.').pop()! : spec.typeText];
-
-                    const childKind = inferContainerKind(spec.typeText, templates);
-                    if (childKind) {
-                        // Internal nodes for the child container
-                        const internalA = childKind === 'Loop' ? `${fullName}_controller` : `${fullName}_entry`;
-                        const internalB = childKind === 'Loop' ? `${fullName}_terminate` : `${fullName}_exit`;
-                        if (!nodes.includes(internalA)) nodes.push(internalA);
-                        if (!nodes.includes(internalB)) nodes.push(internalB);
-                        nodeTypes[internalA] = childKind === 'Loop' ? 'Controller' : 'entry';
-                        nodeTypes[internalB] = childKind === 'Loop' ? 'TerminateNode' : 'exit';
-                        subgraphs[fullName] = [internalA, internalB];
-
-                        // Determine nested declarative lists from template or positional args.
-                        const extracted =
-                            !templateInfo?.nodesArg && !templateInfo?.edgesArg && spec.args?.length
-                                ? extractContainerListsFromArgs(spec.args, componentCode, literalValues)
-                                : {};
-                        const childNodesNode = templateInfo?.nodesArg ?? (extracted as any).nodesNode;
-                        const childEdgesNode = templateInfo?.edgesArg ?? (extracted as any).edgesNode;
-                        if (childNodesNode || childEdgesNode) {
-                            expandContainer(fullName, childKind, childNodesNode, childEdgesNode);
-                        }
-                    }
-                }
-            }
-
-            if (edgesNode) {
-                const specs = parseEdgesListLiteral(edgesNode, componentCode, literalValues);
-                for (const spec of specs) {
-                    const from = `${prefix}${normalizeContainerEndpoint(spec.from, kind)}`;
-                    const to = `${prefix}${normalizeContainerEndpoint(spec.to, kind)}`;
-
-                    if (!nodes.includes(from)) {
-                        nodes.push(from);
-                        nodeTypes[from] = nodeTypes[from] || 'Node';
-                    }
-                    if (!nodes.includes(to)) {
-                        nodes.push(to);
-                        nodeTypes[to] = nodeTypes[to] || 'Node';
-                    }
-
-                    const { keys, keysDetails } = parseEdgeKeysArgument(spec.keysNode, componentCode);
-                    edges.push({
-                        from,
-                        to,
-                        keys,
-                        keysDetails,
-                        lineNumber: spec.lineNumber
-                    });
-                }
-            }
-        };
-
-        expandContainer('', baseType, target.nodesArg, target.edgesArg);
-
-        return {
-            nodes,
-            nodeTypes,
-            nodeLineNumbers,
-            nodePullKeys,
-            nodePushKeys,
-            nodeAttributes,
-            edges,
-            subgraphs,
-            hasComplexStructure: false
-        };
+        return buildTemplateStructure(
+            {
+                ...target,
+                scopedTemplates: {
+                    ...(target.scopedTemplates || {}),
+                    ...templates
+                },
+                literalValues: {
+                    ...(target.literalValues || {}),
+                    ...literalValues
+                },
+                sourceCode: target.sourceCode || componentCode
+            },
+            componentCode
+        );
     } catch (error) {
         console.error(`[ComponentParser] Error parsing NodeTemplate ${templateName}:`, error);
         return null;
     }
+}
+
+export function buildTemplateStructure(
+    target: ParsedNodeTemplate,
+    componentCode: string
+): ComponentStructure | null {
+    if (target.baseKind !== 'Graph' && target.baseKind !== 'Loop') {
+        return null;
+    }
+
+    const templates: { [name: string]: ParsedNodeTemplate } = {
+        ...(target.scopedTemplates || {})
+    };
+    const literalValues: { [name: string]: TSNode } = {
+        ...(target.literalValues || {})
+    };
+    templates[target.templateName] = target;
+    const normalizedTemplateName = target.templateName.includes('.')
+        ? target.templateName.split('.').pop()!
+        : target.templateName;
+    templates[normalizedTemplateName] = target;
+
+    const baseType = target.baseKind;
+
+    const nodes: string[] = [];
+    const nodeTypes: { [key: string]: string } = {};
+    const nodeLineNumbers: { [key: string]: number } = {};
+    if (baseType === 'Loop') {
+        nodes.push('controller', 'terminate');
+        nodeTypes['controller'] = 'Controller';
+        nodeTypes['terminate'] = 'TerminateNode';
+    } else {
+        nodes.push('entry', 'exit');
+        nodeTypes['entry'] = 'entry';
+        nodeTypes['exit'] = 'exit';
+    }
+
+    const nodePullKeys: { [key: string]: { [key: string]: any } | null | 'empty' } = {};
+    const nodePushKeys: { [key: string]: { [key: string]: any } | null | 'empty' } = {};
+    const nodeAttributes: { [key: string]: { [key: string]: any } | null } = {};
+    const edges: GraphEdge[] = [];
+    const subgraphs: { [parent: string]: string[] } = {};
+
+    const resolveTemplateByType = (
+        typeText: string,
+        scopeTemplates: { [name: string]: ParsedNodeTemplate }
+    ): ParsedNodeTemplate | undefined => {
+        return (
+            scopeTemplates[typeText] ||
+            scopeTemplates[typeText.includes('.') ? typeText.split('.').pop()! : typeText] ||
+            templates[typeText] ||
+            templates[typeText.includes('.') ? typeText.split('.').pop()! : typeText]
+        );
+    };
+
+    const expandContainer = (
+        containerKey: string,
+        kind: 'Graph' | 'Loop',
+        nodesNode: TSNode | undefined,
+        edgesNode: TSNode | undefined,
+        scopeCode: string,
+        scopeLiteralValues: { [name: string]: TSNode },
+        scopeTemplates: { [name: string]: ParsedNodeTemplate }
+    ) => {
+        const prefix = containerKey ? `${containerKey}_` : '';
+
+        if (nodesNode) {
+            const specs = parseNodesListLiteral(nodesNode, scopeCode, scopeLiteralValues);
+            for (const spec of specs) {
+                const templateInfo = resolveTemplateByType(spec.typeText, scopeTemplates);
+                const childKind = inferContainerKind(spec.typeText, scopeTemplates) || inferContainerKind(spec.typeText, templates);
+                const typeLabel =
+                    templateInfo?.nodeClass
+                        ? normalizeTypeLabel(templateInfo.nodeClass)
+                        : childKind
+                            ? childKind
+                            : normalizeTypeLabel(spec.typeText || 'Node');
+                const fullName = `${prefix}${spec.name}`;
+                if (!nodes.includes(fullName)) nodes.push(fullName);
+                if (!nodeTypes[fullName]) nodeTypes[fullName] = typeLabel;
+                if (!nodeLineNumbers[fullName]) nodeLineNumbers[fullName] = spec.lineNumber;
+
+                if (containerKey) {
+                    if (!subgraphs[containerKey]) subgraphs[containerKey] = [];
+                    if (!subgraphs[containerKey].includes(fullName)) subgraphs[containerKey].push(fullName);
+                }
+                if (childKind) {
+                    const internalA = childKind === 'Loop' ? `${fullName}_controller` : `${fullName}_entry`;
+                    const internalB = childKind === 'Loop' ? `${fullName}_terminate` : `${fullName}_exit`;
+                    if (!nodes.includes(internalA)) nodes.push(internalA);
+                    if (!nodes.includes(internalB)) nodes.push(internalB);
+                    nodeTypes[internalA] = childKind === 'Loop' ? 'Controller' : 'entry';
+                    nodeTypes[internalB] = childKind === 'Loop' ? 'TerminateNode' : 'exit';
+                    subgraphs[fullName] = [internalA, internalB];
+
+                    const extracted =
+                        !templateInfo?.nodesArg && !templateInfo?.edgesArg && spec.args?.length
+                            ? extractContainerListsFromArgs(spec.args, scopeCode, scopeLiteralValues)
+                            : {};
+                    const childNodesNode = templateInfo?.nodesArg ?? (extracted as any).nodesNode;
+                    const childEdgesNode = templateInfo?.edgesArg ?? (extracted as any).edgesNode;
+                    if (childNodesNode || childEdgesNode) {
+                        const childScopeCode =
+                            templateInfo?.nodesArg || templateInfo?.edgesArg
+                                ? templateInfo.sourceCode || scopeCode
+                                : scopeCode;
+                        const childScopeLiteralValues =
+                            templateInfo?.nodesArg || templateInfo?.edgesArg
+                                ? {
+                                      ...scopeLiteralValues,
+                                      ...(templateInfo.literalValues || {})
+                                  }
+                                : scopeLiteralValues;
+                        const childScopeTemplates =
+                            templateInfo?.nodesArg || templateInfo?.edgesArg
+                                ? {
+                                      ...templates,
+                                      ...(templateInfo.scopedTemplates || {})
+                                  }
+                                : scopeTemplates;
+                        expandContainer(
+                            fullName,
+                            childKind,
+                            childNodesNode,
+                            childEdgesNode,
+                            childScopeCode,
+                            childScopeLiteralValues,
+                            childScopeTemplates
+                        );
+                    }
+                }
+            }
+        }
+
+        if (edgesNode) {
+            const specs = parseEdgesListLiteral(edgesNode, scopeCode, scopeLiteralValues);
+            for (const spec of specs) {
+                const from = `${prefix}${normalizeContainerEndpoint(spec.from, kind)}`;
+                const to = `${prefix}${normalizeContainerEndpoint(spec.to, kind)}`;
+
+                if (!nodes.includes(from)) {
+                    nodes.push(from);
+                    nodeTypes[from] = nodeTypes[from] || 'Node';
+                }
+                if (!nodes.includes(to)) {
+                    nodes.push(to);
+                    nodeTypes[to] = nodeTypes[to] || 'Node';
+                }
+
+                const { keys, keysDetails } = parseEdgeKeysArgument(spec.keysNode, scopeCode);
+                edges.push({
+                    from,
+                    to,
+                    keys,
+                    keysDetails,
+                    lineNumber: spec.lineNumber
+                });
+            }
+        }
+    };
+
+    expandContainer('', baseType, target.nodesArg, target.edgesArg, componentCode, literalValues, templates);
+
+    return {
+        nodes,
+        nodeTypes,
+        nodeLineNumbers,
+        nodePullKeys,
+        nodePushKeys,
+        nodeAttributes,
+        edges,
+        subgraphs,
+        hasComplexStructure: false
+    };
 }
 
 /**
@@ -529,7 +606,8 @@ function parseBuildMethodForComponent(
         nodePullKeys: {},
         nodePushKeys: {},
         nodeAttributes: {},
-        subgraphParents: {}
+        subgraphParents: {},
+        literalValues: {}
     };
     
     const edges: GraphEdge[] = [];
@@ -537,7 +615,8 @@ function parseBuildMethodForComponent(
         edges,
         variableToNodeName: nodeCtx.variableToNodeName,
         nodes,
-        subgraphParents: {}
+        subgraphParents: {},
+        literalValues: nodeCtx.literalValues
     };
     
     const subgraphs: { [parent: string]: string[] } = {};

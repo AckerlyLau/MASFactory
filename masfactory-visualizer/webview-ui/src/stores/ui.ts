@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 
-export type TabId = 'preview' | 'debug' | 'run' | 'vibe';
+export type TabId = 'preview' | 'debug' | 'run' | 'drag' | 'vibe';
 
 export const useUiStore = defineStore('ui', {
   state: () => ({

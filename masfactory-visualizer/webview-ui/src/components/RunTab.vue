@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRuntimeStore } from '../stores/runtime';
 import SessionDetail from './SessionDetail.vue';
 
@@ -7,6 +7,84 @@ const runtime = useRuntimeStore();
 
 const sessions = computed(() => runtime.runSessions);
 const selectedId = computed(() => runtime.selectedRunSessionId);
+
+const layoutRef = ref<HTMLDivElement | null>(null);
+const sidebarWidth = ref<number>(280);
+const SIDEBAR_WIDTH_KEY = 'masfactory-visualizer.run.sidebarWidth';
+const SIDEBAR_WIDTH_MIN = 88;
+const DETAIL_WIDTH_MIN = 320;
+const SIDEBAR_WIDTH_MAX = 620;
+
+let resizeMove: ((e: MouseEvent) => void) | null = null;
+let resizeUp: (() => void) | null = null;
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function loadSidebarWidth(): void {
+  try {
+    const raw = window.localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    const next = Number(raw);
+    if (Number.isFinite(next) && next > 0) {
+      sidebarWidth.value = clamp(Math.round(next), SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function persistSidebarWidth(): void {
+  try {
+    window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(sidebarWidth.value)));
+  } catch {
+    // ignore
+  }
+}
+
+function resetSidebarWidth(): void {
+  sidebarWidth.value = 280;
+  persistSidebarWidth();
+}
+
+function startResizeSidebar(e: MouseEvent): void {
+  if (e.button !== 0) return;
+  if (!layoutRef.value) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const root = layoutRef.value;
+  const applyAt = (clientX: number) => {
+    const rect = root.getBoundingClientRect();
+    const maxFromContainer = Math.max(
+      SIDEBAR_WIDTH_MIN,
+      Math.floor(rect.width - 10 - DETAIL_WIDTH_MIN)
+    );
+    const max = clamp(maxFromContainer, SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+    sidebarWidth.value = clamp(Math.round(clientX - rect.left), SIDEBAR_WIDTH_MIN, max);
+  };
+
+  const prevCursor = document.body.style.cursor;
+  const prevUserSelect = document.body.style.userSelect;
+  document.body.style.cursor = 'col-resize';
+  document.body.style.userSelect = 'none';
+
+  applyAt(e.clientX);
+
+  resizeMove = (evt: MouseEvent) => applyAt(evt.clientX);
+  resizeUp = () => {
+    if (resizeMove) window.removeEventListener('mousemove', resizeMove, true);
+    if (resizeUp) window.removeEventListener('mouseup', resizeUp, true);
+    resizeMove = null;
+    resizeUp = null;
+    document.body.style.cursor = prevCursor;
+    document.body.style.userSelect = prevUserSelect;
+    persistSidebarWidth();
+  };
+
+  window.addEventListener('mousemove', resizeMove, true);
+  window.addEventListener('mouseup', resizeUp, true);
+}
 
 function isAlive(sessionId: string): boolean {
   return runtime.isSessionAlive(sessionId);
@@ -27,6 +105,17 @@ function deleteSession(sessionId: string) {
 function backToList() {
   runtime.clearRunSelection();
 }
+
+onMounted(() => {
+  loadSidebarWidth();
+});
+
+onBeforeUnmount(() => {
+  if (resizeMove) window.removeEventListener('mousemove', resizeMove, true);
+  if (resizeUp) window.removeEventListener('mouseup', resizeUp, true);
+  resizeMove = null;
+  resizeUp = null;
+});
 </script>
 
 <template>
@@ -71,8 +160,14 @@ function backToList() {
     </div>
 
     <!-- Selected: sidebar list + right detail -->
-    <div v-else class="split">
-      <aside class="sidebar">
+    <div v-else ref="layoutRef" class="split">
+      <aside class="sidebar" :style="{ width: `${sidebarWidth}px`, minWidth: `${sidebarWidth}px` }">
+        <div
+          class="sidebar-resize-handle"
+          title="Drag to resize session list width (double-click to reset)"
+          @mousedown="startResizeSidebar"
+          @dblclick="resetSidebarWidth"
+        ></div>
         <button
           v-for="s in sessions"
           :key="s.id"
@@ -257,14 +352,40 @@ function backToList() {
 }
 
 .sidebar {
-  width: 280px;
-  min-width: 280px;
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 8px;
   overflow: auto;
   border-right: 1px solid var(--vscode-panel-border, #2d2d2d);
   padding-right: 10px;
+  box-sizing: border-box;
+}
+
+.sidebar-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -5px;
+  width: 10px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 5;
+}
+
+.sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 4px;
+  width: 2px;
+  height: 100%;
+  border-radius: 999px;
+  background: rgba(128, 128, 128, 0.22);
+  transition: background 120ms ease;
+}
+
+.sidebar-resize-handle:hover::after {
+  background: rgba(128, 128, 128, 0.45);
 }
 
 .session {

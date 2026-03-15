@@ -3,7 +3,7 @@ import type { AppInboundMessage } from './protocol';
 import { parseAppInboundMessage } from './protocol';
 
 export type DispatchUi = {
-  setActiveTab: (tab: 'preview' | 'debug' | 'run' | 'vibe') => void;
+  setActiveTab: (tab: 'preview' | 'debug' | 'run' | 'drag' | 'vibe') => void;
   markRunActivity?: (sessionId: string | null | undefined) => void;
 };
 
@@ -80,7 +80,7 @@ export function dispatchVsCodeMessage(
         text: msg.text
       });
       if (ok) {
-        ctx.ui.setActiveTab('vibe');
+        ctx.ui.setActiveTab('drag');
       }
       return;
     }
