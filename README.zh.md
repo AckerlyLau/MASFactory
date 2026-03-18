@@ -26,6 +26,13 @@
   <a href="LICENSE">
     <img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-5b8c5a" />
   </a>
+  <br />
+  <a href="https://discord.gg/SSxm8yrDGt">
+    <img alt="Discord" src="https://img.shields.io/badge/Contact-Discord-5865F2?logo=discord&logoColor=white" />
+  </a>
+  <a href="https://qm.qq.com/cgi-bin/qm/qr?k=jTn5-wNlUg2SZ0OfyMlA4h9eqBx4OX6x&amp;jump_from=webapi&amp;authKey=NDNs1xg1usRYTIuO7XsgQjJVYqwntJL6NX1pOmR9J15tAPoJ8B3NSAVTD1tnR2+m">
+    <img alt="QQ" src="https://img.shields.io/badge/Contact-QQ-12B7F5?logo=qq&logoColor=white" />
+  </a>
 </p>
 
 **MASFactory** 是一个以图结构为核心的 Multi‑Agent Orchestration 框架，面向 **Vibe Graphing** 场景打造：
@@ -281,3 +288,7 @@ python applications/camel/main.py "Create a sample adder by using python"
 ## ⭐ Star 趋势
 
 [![Star History Chart](https://api.star-history.com/svg?repos=BUPT-GAMMA/MASFactory&type=Date)](https://star-history.com/#BUPT-GAMMA/MASFactory&Date)
+
+## 📬 交流讨论组
+QQ: 2157069383
+Discord: https://discord.gg/SSxm8yrDGt
