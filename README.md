@@ -210,6 +210,32 @@ out, _attrs = g.invoke({"query": "I want to learn Python. Where should I start?"
 print(out["answer"])
 ```
 
+## 🌟 Application Demo
+
+Below are two example applications built with MASFactory for two common scenarios: a daily AI paper briefing and a paper-to-PPT workflow. The workflow code behind both products is open-sourced in this repository for reuse and study.
+
+### NowWhat
+
+**NowWhat** stands for "Now what are my peers working on?" It is an information-filtering app for AI researchers and developers. The service turns a daily stream of AI papers into a structured briefing, helping users quickly understand which papers are worth reading and what signals matter most.
+
+- Hosted experience: `https://what.masfactory.dev`
+- Workflow source: [`applications/nowwhat/README.md`](applications/nowwhat/README.md)
+
+<p align="center">
+  <img src="applications/nowwhat/assets/nowwhat-preview-en.png" alt="NowWhat English product preview" width="980" />
+</p>
+
+### OhNoPPT
+
+**OhNoPPT** is a **Paper2PPT** application for research-paper presentations. Users upload a paper and describe the presentation goal, and MASFactory orchestrates the full process from paper understanding to deck generation. Unlike many slide-generation tools that stop at static exports, OhNoPPT delivers a genuinely editable `.pptx` file.
+
+- Hosted experience: `https://ppt.masfactory.dev`
+- Workflow source: [`applications/ohnoppt/README.md`](applications/ohnoppt/README.md)
+
+<p align="center">
+  <img src="applications/ohnoppt/assets/ohnoppt-preview-en.png" alt="OhNoPPT English product preview" width="980" />
+</p>
+
 ## ▶️ Run the Multi-Agent Reproductions in This Repo (`applications/`)
 
 Most workflows require `OPENAI_API_KEY`. Some scripts also read `OPENAI_BASE_URL` / `BASE_URL` and `OPENAI_MODEL_NAME`.
@@ -268,6 +294,8 @@ Documentation: https://docs.masfactory.dev/
 │   ├── camel/
 │   ├── hugggpt2/
 │   ├── metagpt/
+│   ├── nowwhat/
+│   ├── ohnoppt/
 │   └── vibegraph_demo/
 ├── docs/                             # VitePress documentation site
 ├── README.md

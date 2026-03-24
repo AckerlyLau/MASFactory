@@ -6,6 +6,28 @@ This directory contains the MASFactory-based **OhNoPPT** paper-to-deck pipeline.
 
 - Hosted experience: `https://ppt.masfactory.dev`
 
+## Overview
+
+**OhNoPPT** is a MASFactory-based **Paper2PPT** application for turning research papers into presentation decks. Users upload a paper, describe the audience and reporting goal, and the system runs a multi-agent pipeline that converts the source material into an editable `.pptx` file instead of a static slide export.
+
+At the end of each major stage, users can inspect the current result and request revisions, which makes the generation process much more controllable for real research talks, project demos, and group meetings.
+
+## Workflow Design
+
+The workflow breaks AI PPT generation into three stages: outline generation, HTML slide generation, and PPTX reconstruction. Each stage combines agent drafting, programmatic validation, and human-in-the-loop review, and the pipeline iterates until it can deliver an editable deck.
+
+<p align="center">
+  <img src="assets/ohnoppt-workflow.png" alt="OhNoPPT workflow in MASFactory" width="920" />
+</p>
+
+## Product Preview
+
+The web app lets users review intermediate slides, compare revisions, and approve the final editable presentation directly in the browser.
+
+<p align="center">
+  <img src="assets/ohnoppt-preview-en.png" alt="OhNoPPT product preview" width="980" />
+</p>
+
 ## Layout
 
 ```text

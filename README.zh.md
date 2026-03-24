@@ -208,6 +208,32 @@ out, _attrs = g.invoke({"query": "我想学习 Python，但不知道从哪里开
 print(out["answer"])
 ```
 
+## 🌟 示例应用
+
+下面展示的是两个基于 MASFactory 构建的示例应用，分别面向“AI 论文日报”和“Paper2PPT”两个典型场景。它们对应的 workflow 代码都已经在本仓库开源，方便学习和复用 MASFactory 的多智能体编排思路。
+
+### NowWhat
+
+**NowWhat** 意为 “Now what are my peers working on?”，是一个面向 AI 研究者与开发者的信息筛选应用。它会每日抓取 AI 领域论文，并基于大模型进行系统化分析与总结，帮助用户快速了解当天值得关注的研究进展。
+
+- 在线体验地址：`https://what.masfactory.dev`
+- Workflow 说明：[`applications/nowwhat/README.md`](applications/nowwhat/README.md)
+
+<p align="center">
+  <img src="applications/nowwhat/assets/nowwhat-preview-zh.png" alt="NowWhat 中文版应用预览" width="980" />
+</p>
+
+### OhNoPPT
+
+**OhNoPPT** 是一个面向论文讲解 PPT 制作场景的 **Paper2PPT** 应用。用户只需要上传论文，并描述汇报场景与目标，系统就会在后台启动基于 MASFactory 的多智能体工作流，自动完成从论文理解到 PPT 生成的整套流程。与多数只能导出静态 slides 的产品不同，OhNoPPT 交付的是可以继续用 Office 编辑修改的 `.pptx` 文件。
+
+- 在线体验地址：`https://ppt.masfactory.dev`
+- Workflow 说明：[`applications/ohnoppt/README.md`](applications/ohnoppt/README.md)
+
+<p align="center">
+  <img src="applications/ohnoppt/assets/ohnoppt-preview-zh.png" alt="OhNoPPT 中文版应用预览" width="980" />
+</p>
+
 ## ▶️ 运行仓库内的多智能体复现（applications/）
 
 多数工作流需要 `OPENAI_API_KEY`；部分脚本也会读取 `OPENAI_BASE_URL` / `BASE_URL` 与 `OPENAI_MODEL_NAME`。
@@ -264,6 +290,8 @@ python applications/camel/main.py "Create a sample adder by using python"
 │   ├── camel/
 │   ├── hugggpt2/
 │   ├── metagpt/
+│   ├── nowwhat/
+│   ├── ohnoppt/
 │   └── vibegraph_demo/
 ├── docs/                             # VitePress 文档站
 ├── README.md

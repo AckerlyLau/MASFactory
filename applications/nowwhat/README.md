@@ -6,6 +6,26 @@ This directory contains the MASFactory-based **NowWhat** daily AI paper digest w
 
 - Hosted experience: `https://what.masfactory.dev`
 
+## Overview
+
+**NowWhat** stands for "Now what are my peers working on?" It is an information-filtering app for AI researchers and developers. The product turns a stream of recent AI papers into a readable daily briefing, helping users quickly see which papers are worth attention and why.
+
+## Workflow Design
+
+During development, we built a full multi-agent review workflow with MASFactory. The system first reads and distills each paper, then routes it through three reviewer groups focused on **Novelty**, **Rigor**, and **Impact**. Their results are aggregated into a ranked shortlist and a structured daily digest.
+
+<p align="center">
+  <img src="assets/nowwhat-workflow.png" alt="NowWhat workflow in MASFactory" width="920" />
+</p>
+
+## Product Preview
+
+The hosted interface presents the generated report as a browsable daily brief, with at-a-glance takeaways on the left and highlighted papers on the right.
+
+<p align="center">
+  <img src="assets/nowwhat-preview-en.png" alt="NowWhat product preview" width="980" />
+</p>
+
 ## Layout
 
 ```text
