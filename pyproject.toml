@@ -1,6 +1,6 @@
 [project]
 name = "masfactory"
-version = "1.0.1"
+version = "1.0.2"
 description = "MASFactory is a graph-centric framework for orchestrating Multi-Agent Systems with Vibe Graphing."
 readme = "README.md"
 requires-python = ">=3.10"
